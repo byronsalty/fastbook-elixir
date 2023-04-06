@@ -2,6 +2,6 @@
 
 ## Chapters
 
-* [Chapter 0: About Elixir](00_about_elixir.livemd)
+* [Chapter 0: About Fastbook for Elixir](00_about_elixir.livemd)
 * [Chapter 1: Intro](01_intro.livemd)
 * [Chapter 4: MNIST Basics](04_mnist_basics.livemd)
