@@ -1,0 +1,23 @@
+# Chapter 4: MNIST Basics
+
+```elixir
+Mix.install([
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.8.0", override: true},
+  {:fastbook_elixir, path: "lib/fastbook_elixir"},
+  {:httpoison, "~> 1.8"},
+  {:poison, "~> 5.0"}
+])
+
+alias FastbookElixir.URLs
+```
+
+## Remove: Test Section
+
+```elixir
+URLs.url_MNIST_SAMPLE()
+```
+
+```elixir
+FastbookElixir.untar_data(URLs.url_MNIST_SAMPLE())
+```
