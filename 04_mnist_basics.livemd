@@ -4,6 +4,11 @@
 Mix.install([
   {:jason, "~> 1.4"},
   {:kino, "~> 0.8.0", override: true},
+  {:image, "~> 0.24.0"},
+  {:nx, "~> 0.4"},
+  {:bumblebee, "~> 0.1"},
+  {:explorer, "~> 0.5.1"},
+  {:exla, "~> 0.4"},
   {:fastbook_elixir, path: "lib/fastbook_elixir"},
   {:httpoison, "~> 1.8"},
   {:poison, "~> 5.0"}
@@ -12,12 +17,46 @@ Mix.install([
 alias FastbookElixir.URLs
 ```
 
-## Remove: Test Section
+## Under the Hood: Training a Digit Classifier
+
+Having seen what it looks like to actually train a variety of models in Chapter 2, let’s now look under the hood and see exactly what is going on. We’ll start by using computer vision to introduce fundamental tools and concepts for deep learning.
+
+To be exact, we'll discuss the roles of arrays and tensors and of broadcasting, a powerful technique for using them expressively. We'll explain stochastic gradient descent (SGD), the mechanism for learning by updating weights automatically. We'll discuss the choice of a loss function for our basic classification task, and the role of mini-batches. We'll also describe the math that a basic neural network is actually doing. Finally, we'll put all these pieces together.
+
+In future chapters we’ll do deep dives into other applications as well, and see how these concepts and tools generalize. But this chapter is about laying foundation stones. To be frank, that also makes this one of the hardest chapters, because of how these concepts all depend on each other. Like an arch, all the stones need to be in place for the structure to stay up. Also like an arch, once that happens, it's a powerful structure that can support other things. But it requires some patience to assemble.
+
+Let's begin. The first step is to consider how images are represented in a computer.
+
+## Pixels: The Foundations of Computer Vision
+
+In order to understand what happens in a computer vision model, we first have to understand how computers handle images. We'll use one of the most famous datasets in computer vision, [MNIST](https://en.wikipedia.org/wiki/MNIST_database), for our experiments. MNIST contains images of handwritten digits, collected by the National Institute of Standards and Technology and collated into a machine learning dataset by Yann Lecun and his colleagues. Lecun used MNIST in 1998 in [Lenet-5](http://yann.lecun.com/exdb/lenet/), the first computer system to demonstrate practically useful recognition of handwritten digit sequences. This was one of the most important breakthroughs in the history of AI.
+
+## Sidebar: Tenacity and Deep Learning
+
+The story of deep learning is one of tenacity and grit by a handful of dedicated researchers. After early hopes (and hype!) neural networks went out of favor in the 1990's and 2000's, and just a handful of researchers kept trying to make them work well. Three of them, Yann Lecun, Yoshua Bengio, and Geoffrey Hinton, were awarded the highest honor in computer science, the Turing Award (generally considered the "Nobel Prize of computer science"), in 2018 after triumphing despite the deep skepticism and disinterest of the wider machine learning and statistics community.
+
+Geoff Hinton has told of how even academic papers showing dramatically better results than anything previously published would be rejected by top journals and conferences, just because they used a neural network. Yann Lecun's work on convolutional neural networks, which we will study in the next section, showed that these models could read handwritten text—something that had never been achieved before. However, his breakthrough was ignored by most researchers, even as it was used commercially to read 10% of the checks in the US!
+
+In addition to these three Turing Award winners, there are many other researchers who have battled to get us to where we are today. For instance, Jurgen Schmidhuber (who many believe should have shared in the Turing Award) pioneered many important ideas, including working with his student Sepp Hochreiter on the long short-term memory (LSTM) architecture (widely used for speech recognition and other text modeling tasks, and used in the IMDb example in <>). Perhaps most important of all, Paul Werbos in 1974 invented back-propagation for neural networks, the technique shown in this chapter and used universally for training neural networks (Werbos 1994). His development was almost entirely ignored for decades, but today it is considered the most important foundation of modern AI.
+
+There is a lesson here for all of us! On your deep learning journey you will face many obstacles, both technical, and (even more difficult) posed by people around you who don't believe you'll be successful. There's one guaranteed way to fail, and that's to stop trying. We've seen that the only consistent trait amongst every fast.ai student that's gone on to be a world-class practitioner is that they are all very tenacious.
+
+## 3s and 7s Classifier
+
+For this initial tutorial we are just going to try to create a model that can classify any image as a 3 or a 7. So let's download a sample of MNIST that contains images of just these digits:
 
 ```elixir
-URLs.url_MNIST_SAMPLE()
+images = FastbookElixir.untar_data(URLs.mnist_sample())
+
+threes = Enum.filter(images, fn {path, _} -> String.match?(path, ~r"/train/3/") end)
+sevens = Enum.filter(images, fn {path, _} -> String.match?(path, ~r"/train/7/") end)
+
+threes
 ```
 
+Let’s take a look at one now. Here’s an image of a handwritten number 3, taken from the famous MNIST dataset of handwritten numbers:
+
 ```elixir
-FastbookElixir.untar_data(URLs.url_MNIST_SAMPLE())
+{_path, content} = Enum.random(threes)
+im3 = Kino.Image.new(content, "image/jpeg")
 ```

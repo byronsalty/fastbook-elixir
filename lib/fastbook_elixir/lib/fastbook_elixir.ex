@@ -27,6 +27,8 @@ defmodule FastbookElixir do
   end
 
   def extract_tar_from_binary(binary) do
+    # https://gist.github.com/nroi/d4b0716a987c46534c04eb6611b78703
+
     with {:ok, files} <- :erl_tar.extract({:binary, binary}, [:memory, :compressed]) do
       files
       |> Enum.map(fn {filename, content} -> {to_string(filename), content} end)
