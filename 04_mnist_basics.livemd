@@ -4,13 +4,15 @@
 Mix.install([
   {:jason, "~> 1.4"},
   {:kino, "~> 0.8.0", override: true},
-  {:image, "~> 0.24.0"},
+  {:image, "~> 0.28.1"},
   {:nx, "~> 0.4"},
+  {:nx_image, "~> 0.1.1"},
   {:bumblebee, "~> 0.1"},
   {:explorer, "~> 0.5.1"},
   {:exla, "~> 0.4"},
   {:fastbook_elixir, path: "lib/fastbook_elixir"},
   {:httpoison, "~> 1.8"},
+  # {:pixels, "~> 0.2.1"},
   {:poison, "~> 5.0"}
 ])
 
@@ -57,6 +59,401 @@ threes
 Let’s take a look at one now. Here’s an image of a handwritten number 3, taken from the famous MNIST dataset of handwritten numbers:
 
 ```elixir
-{_path, content} = Enum.random(threes)
-im3 = Kino.Image.new(content, "image/jpeg")
+{im3_path, content} = Enum.random(threes)
+im3 = Kino.Image.new(content, "image/png")
 ```
+
+Here we are using the Image class from the Kino library. We have installed Kino as a dependency and so Livebook displays the image for us automatically.
+
+<!-- livebook:{"break_markdown":true} -->
+
+In a computer, everything is represented as a number. To view the numbers that make up this image, we have to convert it to an Nx tensor. For instance, here's what a section of the image looks like, converted to a tensor:
+
+```elixir
+image_tensor =
+  content
+  |> Image.from_binary!()
+  |> Image.to_nx!()
+```
+
+The Nx library also includs NxImage to provide some standard image manipulations. Where we'll grab a 16x16 crop from the center of the original image.
+
+```elixir
+# NxImage code to create a 16x16 crop in the center
+center_cropped_tensor = NxImage.center_crop(image_tensor, {16, 16})
+
+# Code to render the image and cropped image in Livebook
+original_image = Kino.Image.new(image_tensor)
+original_label = Kino.Markdown.new("**Original image**")
+
+cropped_image = Kino.Image.new(center_cropped_tensor)
+cropped_label = Kino.Markdown.new("**Cropped image**")
+
+Kino.Layout.grid([
+  Kino.Layout.grid([original_image, original_label], boxed: true),
+  Kino.Layout.grid([cropped_image, cropped_label], boxed: true)
+])
+```
+
+**TODO:** Is there a way to render a dataframe like Python in Kino?
+
+<!-- livebook:{"break_markdown":true} -->
+
+You can see that the background black pixels are stored as the number 0, white is the number 255, and shades of gray are between the two. The entire image contains 28 pixels across and 28 pixels down, for a total of 784 pixels. (This is much smaller than an image that you would get from a phone camera, which has millions of pixels, but is a convenient size for our initial learning and experiments. We will build up to bigger, full-color images soon.)
+
+So, now you've seen what an image looks like to a computer, let's recall our goal: create a model that can recognize 3s and 7s. How might you go about getting a computer to do that?
+
+> Warning: Stop and Think!: Before you read on, take a moment to think about how a computer might be able to recognize these two different digits. What kinds of features might it be able to look at? How might it be able to identify these features? How could it combine them together? Learning works best when you try to solve problems yourself, rather than just reading somebody else's answers; so step away from this book for a few minutes, grab a piece of paper and pen, and jot some ideas down…
+
+## First: Try Pixel Simularity
+
+So, here is a first idea: how about we find the average pixel value for every pixel of the 3s, then do the same for the 7s. This will give us two group averages, defining what we might call the "ideal" 3 and 7. Then, to classify an image as one digit or the other, we see which of these two ideal digits the image is most similar to. This certainly seems like it should be better than nothing, so it will make a good baseline.
+
+<!-- livebook:{"break_markdown":true} -->
+
+> jargon: Baseline: A simple model which you are confident should perform reasonably well. It should be very simple to implement, and very easy to test, so that you can then test each of your improved ideas, and make sure they are always better than your baseline. Without starting with a sensible baseline, it is very difficult to know whether your super-fancy models are actually any good. One good approach to creating a baseline is doing what we have done here: think of a simple, easy-to-implement model. Another good approach is to search around to find other people that have solved similar problems to yours, and download and run their code on your dataset. Ideally, try both of these!
+
+<!-- livebook:{"break_markdown":true} -->
+
+Step one for our simple model is to get the average of pixel values for each of our two groups. In the process of doing this, we will learn a lot of neat Python numeric programming tricks!
+
+Let's create a tensor containing all of our 3s stacked together. We already know how to create a tensor containing a single image. To create a tensor containing all the images in a directory, we will first use a Python list comprehension to create a plain list of the single image tensors.
+
+We will use Jupyter to do some little checks of our work along the way—in this case, making sure that the number of returned items seems reasonable:
+
+```elixir
+seven_tensors =
+  Enum.map(sevens, fn {_path, content} ->
+    content
+    |> Image.from_binary!()
+    |> Image.to_nx!()
+    |> Nx.reshape({28, 28})
+  end)
+
+three_tensors =
+  Enum.map(threes, fn {_path, content} ->
+    content
+    |> Image.from_binary!()
+    |> Image.to_nx!()
+    |> Nx.reshape({28, 28})
+  end)
+
+{Enum.count(three_tensors), Enum.count(seven_tensors)}
+```
+
+We'll also check that one of the images looks okay.
+
+Since we now have tensors (which Livebook by default will print as data), rather than images, we need to use Livebook's Kino.Image module to display it:
+
+```elixir
+# Creating an image from a tensor requires a third rank to represent 'channel'
+
+image_tensor = Nx.reshape(hd(three_tensors), {28, 28, 1})
+Kino.Image.new(image_tensor)
+# Kino.Image.new(hd(three_tensors))
+```
+
+For every pixel position, we want to compute the average over all the images of the intensity of that pixel. To do this we first combine all the images in this list into a single three-dimensional tensor. The most common way to describe such a tensor is to call it a *rank-3 tensor*. We often need to stack up individual tensors in a collection into a single tensor. Unsurprisingly, Nx comes with a function called `stack` that we can use for this purpose.
+
+Notice that Nx does not require special handling to cast types to a float.
+
+Generally when images are floats, the pixel values are expected to be between 0 and 1, so we will also divide by 255 here:
+
+```elixir
+stacked_sevens = Nx.stack(seven_tensors) |> Nx.divide(255)
+stacked_threes = Nx.stack(three_tensors) |> Nx.divide(255)
+
+stacked_threes.shape
+```
+
+Perhaps the most important attribute of a tensor is its shape. This tells you the length of each axis. In this case, we can see that we have 6,131 images, each of size 28×28 pixels. There is nothing specifically about this tensor that says that the first axis is the number of images, the second is the height, and the third is the width—the semantics of a tensor are entirely up to us, and how we construct it. As far as Nx is concerned, it is just a bunch of numbers in memory.
+
+The length of a tensor's shape is its rank:
+
+```elixir
+length(Tuple.to_list(stacked_threes.shape))
+```
+
+It is really important for you to commit to memory and practice these bits of tensor jargon: **rank** is the number of axes or dimensions in a tensor; **shape** is the size of each axis of a tensor.
+
+A: Watch out because the term "dimension" is sometimes used in two ways. Consider that we live in "three-dimensonal space" where a physical position can be described by a 3-vector v. But according to PyTorch, the attribute v.ndim (which sure looks like the "number of dimensions" of v) equals one, not three! Why? Because v is a vector, which is a tensor of rank one, meaning that it has only one axis (even if that axis has a length of three). In other words, sometimes dimension is used for the size of an axis ("space is three-dimensional"); other times, it is used for the rank, or the number of axes ("a matrix has two dimensions"). When confused, I find it helpful to translate all statements into terms of rank, axis, and length, which are unambiguous terms.
+
+<!-- livebook:{"break_markdown":true} -->
+
+We can also get a tensor's rank directly with `rank`:
+
+```elixir
+Nx.rank(stacked_threes)
+```
+
+Finally, we can compute what the ideal 3 looks like. We calculate the mean of all the image tensors by taking the mean along dimension 0 of our stacked, rank-3 tensor. This is the dimension that indexes over all the images.
+
+In other words, for every pixel position, this will compute the average of that pixel over all images. The result will be one value for every pixel position, or a single image. Here it is:
+
+```elixir
+mean3 = Nx.mean(stacked_threes, axes: [0])
+
+# Note to display the image we need to convert back to an unsigned int between 0-255
+mean3_image =
+  mean3
+  |> Nx.multiply(255)
+  |> Nx.floor()
+  |> Nx.reshape({28, 28, 1})
+  |> Nx.as_type(:u8)
+
+Kino.Image.new(mean3_image)
+```
+
+According to this dataset, this is the ideal number 3! (You may not like it, but this is what peak number 3 performance looks like.) You can see how it's very dark where all the images agree it should be dark, but it becomes wispy and blurry where the images disagree.
+
+Let's do the same thing for the 7s, but put all the steps together at once to save some time:
+
+```elixir
+mean7 = Nx.mean(stacked_sevens, axes: [0])
+
+FastbookElixir.show_image(mean7)
+```
+
+Let's now pick an arbitrary 3 and measure its *distance* from our "ideal digits."
+
+> stop: Stop and Think!: How would you calculate how similar a particular image is to each of our ideal digits? Remember to step away from this book and jot down some ideas before you move on! Research shows that recall and understanding improves dramatically when you are engaged with the learning process by solving problems, experimenting, and trying new ideas yourself
+
+Here's a sample 3:
+
+```elixir
+a_3 = stacked_threes[1]
+FastbookElixir.show_image(a_3)
+```
+
+How can we determine its distance from our ideal 3? We can't just add up the differences between the pixels of this image and the ideal digit. Some differences will be positive while others will be negative, and these differences will cancel out, resulting in a situation where an image that is too dark in some places and too light in others might be shown as having zero total differences from the ideal. That would be misleading!
+
+To avoid this, there are two main ways data scientists measure distance in this context:
+
+* Take the mean of the *absolute value* of differences (absolute value is the function that replaces negative values with positive values). This is called the *mean absolute difference* or *L1 norm*
+* Take the mean of the *square* of differences (which makes everything positive) and then take the *square root* (which undoes the squaring). This is called the *root mean squared error* (RMSE) or *L2 norm*.
+
+> important: It's Okay to Have Forgotten Your Math: In this book we generally assume that you have completed high school math, and remember at least some of it... But everybody forgets some things! It all depends on what you happen to have had reason to practice in the meantime. Perhaps you have forgotten what a _square root_ is, or exactly how they work. No problem! Any time you come across a maths concept that is not explained fully in this book, don't just keep moving on; instead, stop and look it up. Make sure you understand the basic idea, how it works, and why we might be using it. One of the best places to refresh your understanding is Khan Academy. For instance, Khan Academy has a great [introduction to square roots](https://www.khanacademy.org/math/algebra/x2f8bb11595b61c86:rational-exponents-radicals/x2f8bb11595b61c86:radicals/v/understanding-square-roots).
+
+<!-- livebook:{"break_markdown":true} -->
+
+Let's try both of these now:
+
+```elixir
+# dist_3_abs = (a_3 - mean3).abs().mean()
+# dist_3_sqr = ((a_3 - mean3)**2).mean().sqrt()
+# dist_3_abs,dist_3_sqr
+
+dist_3_abs = Nx.subtract(a_3, mean3) |> Nx.abs() |> Nx.mean()
+dist_3_sqr = Nx.subtract(a_3, mean3) |> Nx.pow(2) |> Nx.mean() |> Nx.sqrt()
+
+{dist_3_abs, dist_3_sqr}
+```
+
+```elixir
+dist_7_abs = Nx.subtract(a_3, mean7) |> Nx.abs() |> Nx.mean()
+dist_7_sqr = Nx.subtract(a_3, mean7) |> Nx.pow(2) |> Nx.mean() |> Nx.sqrt()
+
+{dist_7_abs, dist_7_sqr}
+```
+
+In both cases, the distance between our 3 and the "ideal" 3 is less than the distance to the ideal 7. So our simple model will give the right prediction in this case.
+
+<!-- livebook:{"break_markdown":true} -->
+
+**TODO:** Are there similar built-in functions for loss in any of the Elixir libraries?
+
+~~PyTorch already provides both of these as *loss functions*. You'll find these inside `torch.nn.functional`, which the PyTorch team recommends importing as `F` (and is available by default under that name in fastai):~~
+
+```elixir
+# The python code
+# F.l1_loss(a_3.float(),mean7), F.mse_loss(a_3,mean7).sqrt()
+```
+
+Here `mse` stands for *mean squared error*, and `l1` refers to the standard mathematical jargon for *mean absolute value* (in math it's called the *L1 norm*).
+
+<!-- livebook:{"break_markdown":true} -->
+
+> S: Intuitively, the difference between L1 norm and mean squared error (MSE) is that the latter will penalize bigger mistakes more heavily than the former (and be more lenient with small mistakes).
+
+<!-- livebook:{"break_markdown":true} -->
+
+> J: When I first came across this "L1" thingie, I looked it up to see what on earth it meant. I found on Google that it is a _vector norm_ using _absolute value_, so looked up _vector norm_ and started reading: _Given a vector space V over a field F of the real or complex numbers, a norm on V is a nonnegative-valued any function p: V → \[0,+∞) with the following properties: For all a ∈ F and all u, v ∈ V, p(u + v) ≤ p(u) + p(v)..._ Then I stopped reading. "Ugh, I'll never understand math!" I thought, for the thousandth time. Since then I've learned that every time these complex mathy bits of jargon come up in practice, it turns out I can replace them with a tiny bit of code! Like, the _L1 loss_ is just equal to `(a-b).abs().mean()`, where `a` and `b` are tensors. I guess mathy folks just think differently than me... I'll make sure in this book that every time some mathy jargon comes up, I'll give you the little bit of code it's equal to as well, and explain in common-sense terms what's going on.
+
+## Nx Tensors
+
+To create a tensor, pass a list (or list of lists, or list of lists of lists, etc.) to Nx.tensor():
+
+```elixir
+data = [[1, 2, 3], [4, 5, 6]]
+tns = Nx.tensor(data)
+```
+
+You can select a row (note that, like lists in Elixir, tensors are 0-indexed so 1 refers to the second row/column):
+
+```elixir
+tns[1]
+```
+
+With Nx you can also name axes and access tensors by dimenson names.
+
+This returns the same results as above but is more understandable with names:
+
+```elixir
+tns_named = Nx.tensor(tns, names: [:y, :x])
+tns_named[y: 1]
+```
+
+And you would use names again to access a column from a tensor (we sometimes refer to the dimensions of tensors/arrays as axes):
+
+```elixir
+tns_named[x: 1]
+```
+
+You can combine these with an Elixir range (start..end with end being *included*) to select part of a row or column:
+
+```elixir
+tns_named[y: 1, x: 1..2]
+```
+
+In order to apply standard operations like add, subtract, multiply, or divide you have to use the Nx functions
+
+```elixir
+Nx.add(tns, 1)
+```
+
+Or you can use the special Nx.Defn module to create functions which allow you to use standard operators such as +, -, *, or / and many others. This is the primary way these functions are expected to be used.
+
+```elixir
+defmodule Example do
+  import Nx.Defn
+
+  defn do_some_math(tensor) do
+    tensor + 1
+  end
+end
+
+Example.do_some_math(tns)
+```
+
+Tensors will automatically adjust types as needed:
+
+```elixir
+[
+  tns.type,
+  Nx.multiply(tns, 1.5).type
+]
+```
+
+## Computing Metrics using Broadcasting
+
+So, is our baseline model any good? To quantify this, we must define a metric.
+
+Recall that a metric is a number that is calculated based on the predictions of our model, and the correct labels in our dataset, in order to tell us how good our model is. For instance, we could use either of the functions we saw in the previous section, mean squared error, or mean absolute error, and take the average of them over the whole dataset. However, neither of these are numbers that are very understandable to most people; in practice, we normally use *accuracy* as the metric for classification models.
+
+As we've discussed, we want to calculate our metric over a *validation set*. This is so that we don't inadvertently overfit—that is, train a model to work well only on our training data. This is not really a risk with the pixel similarity model we're using here as a first try, since it has no trained components, but we'll use a validation set anyway to follow normal practices and to be ready for our second try later.
+
+To get a validation set we need to remove some of the data from training entirely, so it is not seen by the model at all. As it turns out, the creators of the MNIST dataset have already done this for us. Do you remember how there was a whole separate directory called *valid*? That's what this directory is for!
+
+So to start with, let's create tensors for our 3s and 7s from that directory. These are the tensors we will use to calculate a metric measuring the quality of our first-try model, which measures distance from an ideal image:
+
+```elixir
+valid_threes = Enum.filter(images, fn {path, _} -> String.match?(path, ~r"/valid/3/") end)
+valid_sevens = Enum.filter(images, fn {path, _} -> String.match?(path, ~r"/valid/7/") end)
+
+valid_7_tens =
+  Enum.map(valid_sevens, fn {_path, content} ->
+    content
+    |> Image.from_binary!()
+    |> Image.to_nx!()
+    |> Nx.reshape({28, 28})
+  end)
+  |> Nx.stack()
+  |> Nx.divide(255)
+
+valid_3_tens =
+  Enum.map(valid_threes, fn {_path, content} ->
+    content
+    |> Image.from_binary!()
+    |> Image.to_nx!()
+    |> Nx.reshape({28, 28})
+  end)
+  |> Nx.stack()
+  |> Nx.divide(255)
+
+[valid_3_tens.shape, valid_7_tens.shape]
+```
+
+It's good to get in the habit of checking shapes as you go. Here we see two tensors, one representing the 3s validation set of 1,010 images of size 28×28, and one representing the 7s validation set of 1,028 images of size 28×28.
+
+We ultimately want to write a function, is_3, that will decide if an arbitrary image is a 3 or a 7. It will do this by deciding which of our two "ideal digits" this arbitrary image is closer to. For that we need to define a notion of distance—that is, a function that calculates the distance between two images.
+
+We can write a simple function that calculates the mean absolute error using an expression very similar to the one we wrote in the last section:
+
+```elixir
+defmodule Chapter4 do
+  import Nx.Defn
+
+  defn mnist_distance(a, b) do
+    (a - b)
+    |> Nx.abs()
+    |> Nx.mean(axes: [-1, -2])
+  end
+end
+
+Chapter4.mnist_distance(a_3, mean3)
+```
+
+This is the same value we previously calculated for the distance between these two images, the ideal 3 mean3 and the arbitrary sample 3 a_3, which are both single-image tensors with a shape of [28,28].
+
+But in order to calculate a metric for overall accuracy, we will need to calculate the distance to the ideal 3 for every image in the validation set. How do we do that calculation? We could write a loop over all of the single-image tensors that are stacked within our validation set tensor, valid_3_tens, which has a shape of [1010,28,28] representing 1,010 images. But there is a better way.
+
+Something very interesting happens when we take this exact same distance function, designed for comparing two single images, but pass in as an argument valid_3_tens, the tensor that represents the 3s validation set:
+
+```elixir
+# valid_3_dist = mnist_distance(valid_3_tens, mean3)
+# valid_3_dist, valid_3_dist.shape
+
+valid_3_dist = Chapter4.mnist_distance(valid_3_tens, mean3)
+
+[valid_3_dist, valid_3_dist.shape]
+```
+
+Instead of complaining about shapes not matching, it returned the distance for every single image as a vector (i.e., a rank-1 tensor) of length 1,010 (the number of 3s in our validation set). How did that happen?
+
+Take another look at our function mnist_distance, and you'll see we have there the subtraction (a-b). The magic trick is that Nx, when it tries to perform a simple subtraction operation between two tensors of different ranks, will use broadcasting. That is, it will automatically expand the tensor with the smaller rank to have the same size as the one with the larger rank. Broadcasting is an important capability that makes tensor code much easier to write.
+
+After broadcasting so the two argument tensors have the same rank, Nx applies its usual logic for two tensors of the same rank: it performs the operation on each corresponding element of the two tensors, and returns the tensor result. For instance:
+
+```elixir
+Nx.add(Nx.tensor([1, 2, 3]), Nx.tensor(1))
+```
+
+So in this case, Nx treats `mean3`, a rank-2 tensor representing a single image, as if it were 1,010 copies of the same image, and then subtracts each of those copies from each 3 in our validation set. What shape would you expect this tensor to have? Try to figure it out yourself before you look at the answer below:
+
+```elixir
+Nx.subtract(valid_3_tens, mean3).shape
+```
+
+We are calculating the difference between our "ideal 3" and each of the 1,010 3s in the validation set, for each of 28×28 images, resulting in the shape `[1010,28,28]`.
+
+**TODO:** Need someone who knows Nx internals to validate these statements
+
+~~There are a couple of important points about how broadcasting is implemented, which make it valuable not just for expressivity but also for performance:~~
+
+* ~~PyTorch doesn't *actually* copy `mean3` 1,010 times. It *pretends* it were a tensor of that shape, but doesn't actually allocate any additional memory~~
+* ~~It does the whole calculation in C (or, if you're using a GPU, in CUDA, the equivalent of C on the GPU), tens of thousands of times faster than pure Python (up to millions of times faster on a GPU!).~~
+
+~~This is true of all broadcasting and elementwise operations and functions done in PyTorch. *It's the most important technique for you to know to create efficient PyTorch code.*~~
+
+Next in `mnist_distance` we see `Nx.abs`. You might be able to guess now what this does when applied to a tensor. It applies the method to each individual element in the tensor, and returns a tensor of the results (that is, it applies the method "elementwise"). So in this case, we'll get back 1,010 matrices of absolute values.
+
+Finally, our function calls `Nx.mean(axes: [-1,-2])`. This tells Nx which axes we want to calculate the mean over. In Elixir, `-1` refers to the last element, and `-2` refers to the second-to-last. So in this case, this tells Nx that we want to take the mean ranging over the values indexed by the last two axes of the tensor. The last two axes are the horizontal and vertical dimensions of an image. After taking the mean over the last two axes, we are left with just the first tensor axis, which indexes over our images, which is why our final size was `(1010)`. In other words, for every image, we averaged the intensity of all the pixels in that image.
+
+We'll be learning lots more about broadcasting throughout this book, especially in <<chapter_foundations>>, and will be practicing it regularly too.
+
+We can use `mnist_distance` to figure out whether an image is a 3 or not by using the following logic: if the distance between the digit in question and the ideal 3 is less than the distance to the ideal 7, then it's a 3. This function will automatically do broadcasting and be applied elementwise, just like all Nx functions and operators:
+
+## Further Elixir Reading
+
+* NxImage examples - https://hexdocs.pm/nx_image/examples.html
+* Nx and MNIST - https://github.com/elixir-nx/nx/blob/main/exla/examples/mnist.exs

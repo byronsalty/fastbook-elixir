@@ -14,16 +14,11 @@ defmodule FastbookElixir do
   """
   def untar_data(url) do
 
-    filename = Path.basename(url)
     # download the url
     data = HTTPoison.get!(url)
-    # write the data to a file
-    #File.write!(filename, data.body)
-
 
     # extract the tar file
-    files = extract_tar_from_binary(data.body)
-    IO.inspect(files)
+    extract_tar_from_binary(data.body)
   end
 
   def extract_tar_from_binary(binary) do
@@ -34,5 +29,26 @@ defmodule FastbookElixir do
       |> Enum.map(fn {filename, content} -> {to_string(filename), content} end)
       |> Map.new
     end
+  end
+
+  def show_image(tensor) do
+    tensor =
+      if Nx.rank(tensor) == 2 do
+        Nx.reshape(tensor, Tuple.append(Nx.shape(tensor), 1))
+      else
+        tensor
+      end
+
+    tensor =
+      if Nx.type(tensor) == {:f, 32} do
+        tensor
+        |> Nx.multiply(255)
+        |> Nx.floor()
+        |> Nx.as_type(:u8)
+      else
+        tensor
+      end
+
+    Kino.Image.new(tensor)
   end
 end

@@ -23,6 +23,11 @@ Where possible this book should skew toward readability. Specifically there are 
 * The original pythonic Fastbook has parts / libraries that make things very easy but at times abstract too much detail. Some of these areas might result in more code in the Elixir version for clarity reasons.
 * I will not opt for the smallest Elixir code possible, sometimes instead breaking things into extra steps for the purpose of clarity.
 
+## Additional Learning Opportunities
+
+* [José introduces Nx](https://www.youtube.com/watch?v=fPKMmJpAGWc)
+
+
 ## Author
 
 This project is a method for me to learn more about both AI/ML and Elixir. 
