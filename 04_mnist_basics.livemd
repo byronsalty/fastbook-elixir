@@ -12,7 +12,6 @@ Mix.install([
   {:exla, "~> 0.4"},
   {:fastbook_elixir, path: "lib/fastbook_elixir"},
   {:httpoison, "~> 1.8"},
-  # {:pixels, "~> 0.2.1"},
   {:poison, "~> 5.0"}
 ])
 
@@ -239,10 +238,6 @@ To avoid this, there are two main ways data scientists measure distance in this 
 Let's try both of these now:
 
 ```elixir
-# dist_3_abs = (a_3 - mean3).abs().mean()
-# dist_3_sqr = ((a_3 - mean3)**2).mean().sqrt()
-# dist_3_abs,dist_3_sqr
-
 dist_3_abs = Nx.subtract(a_3, mean3) |> Nx.abs() |> Nx.mean()
 dist_3_sqr = Nx.subtract(a_3, mean3) |> Nx.pow(2) |> Nx.mean() |> Nx.sqrt()
 
@@ -410,11 +405,7 @@ But in order to calculate a metric for overall accuracy, we will need to calcula
 Something very interesting happens when we take this exact same distance function, designed for comparing two single images, but pass in as an argument valid_3_tens, the tensor that represents the 3s validation set:
 
 ```elixir
-# valid_3_dist = mnist_distance(valid_3_tens, mean3)
-# valid_3_dist, valid_3_dist.shape
-
 valid_3_dist = Chapter4.mnist_distance(valid_3_tens, mean3)
-
 [valid_3_dist, valid_3_dist.shape]
 ```
 
