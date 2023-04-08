@@ -662,7 +662,7 @@ time = Nx.iota({20})
 ```elixir
 # speed = torch.randn(20)*3 + 0.75*(time-9.5)**2 + 1
 
-defmodule Chapter4Again do
+defmodule Chapter4B do
   import Nx.Defn
 
   defn get_speed(x) do
@@ -672,7 +672,7 @@ defmodule Chapter4Again do
   end
 end
 
-speed = Chapter4Again.get_speed(time)
+speed = Chapter4B.get_speed(time)
 ```
 
 ![](images/graph_speed_plot.png)
@@ -687,7 +687,36 @@ We want to distinguish clearly between the function's input (the time when we ar
 # def f(t, params):
 #     a,b,c = params
 #     return a*(t**2) + (b*t) + c
+
+defmodule Chapter4C do
+  import Nx.Defn
+
+  defn f(t, params) do
+    {a, b, c} = params
+    a * t ** 2 + b * t + c
+  end
+end
 ```
+
+In other words, we've restricted the problem of finding the best imaginable function that fits the data, to finding the best *quadratic* function. This greatly simplifies the problem, since every quadratic function is fully defined by the three parameters `a`, `b`, and `c`. Thus, to find the best quadratic function, we only need to find the best values for `a`, `b`, and `c`.
+
+If we can solve this problem for the three parameters of a quadratic function, we'll be able to apply the same approach for other, more complex functions with more parameters—such as a neural net. Let's find the parameters for `f` first, and then we'll come back and do the same thing for the MNIST dataset with a neural net.
+
+We need to define first what we mean by "best." We define this precisely by choosing a *loss function*, which will return a value based on a prediction and a target, where lower values of the function correspond to "better" predictions. It is important for loss functions to return _lower_ values when predictions are more accurate, as the SGD procedure we defined earlier will try to _minimize_ this loss. For continuous data, it's common to use *mean squared error*:
+
+```elixir
+# def mse(preds, targets): return ((preds-targets)**2).mean()
+
+mse = fn preds, targets -> Nx.subtract(preds, targets) |> Nx.pow(2) |> Nx.mean() end
+```
+
+Now, let's work through our 7 step process.
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Step 1: Initialize the parameters
+
+First, we initialize the parameters to random values, and tell PyTorch that we want to track their gradients, using `requires_grad_`:
 
 ## Further Elixir Reading
 

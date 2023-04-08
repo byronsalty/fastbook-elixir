@@ -27,9 +27,8 @@ Where possible this book should skew toward readability. Specifically there are 
 
 * [José introduces Nx](https://www.youtube.com/watch?v=fPKMmJpAGWc)
 
-
 ## Author
 
-This project is a method for me to learn more about both AI/ML and Elixir. 
+This project is a method for me to learn more about both AI/ML and Elixir.
 
 Feel free to contribute and offer corrections where things can be done better.

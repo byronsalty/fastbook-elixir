@@ -192,11 +192,40 @@ Deviation from original
 
 <!-- livebook:{"break_markdown":true} -->
 
-**TODO:**
+#### Nx
 
-Add more about the Elixir libraries and the differences between them.
+Nx is the backbone of ML on Elixir. It gives us powerful numerical functions that enable ML. Similar to Python's NumPy.
 
-...
+[From the docs](https://hexdocs.pm/nx):
+
+> Elixir Nx is a numerical computing library to smoothly integrate to typed, multidimensional data implemented on other platforms (called tensors). This support extends to the compilers and libraries that support those tensors.
+
+#### Axon
+
+[Axon](https://hexdocs.pm/axon) is a high-level interface for creating neural network models.
+
+#### AxonOnnx
+
+AxonOnnx is library to allow dealing with models.
+
+[From the docs](https://hexdocs.pm/axon_onnx):
+
+> ONNX is a Neural Network specification supported by most popular deep learning frameworks such as PyTorch and TensorFlow. AxonOnnx allows you to convert to and from ONNX models via a simple import/export API.
+
+#### Bumblebee
+
+Bumblebee makes using and training models easier.
+
+[From the docs](https://hexdocs.pm/bumblebee):
+
+> Pre-trained Axon models for easy inference and boosted training.
+> Bumblebee provides state-of-the-art, configurable Axon models. On top of that, it streamlines the process of loading pre-trained models by integrating with Hugging Face Hub and 🤗 Transformers.
+
+#### Scholar
+
+[From the docs](https://hexdocs.pm/scholar):
+
+> Traditional machine learning tools built on top of Nx. Scholar implements several algorithms for classification, regression, clustering, dimensionality reduction, metrics, and preprocessing.
 
 <!-- livebook:{"break_markdown":true} -->
 
