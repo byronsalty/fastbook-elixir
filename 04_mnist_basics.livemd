@@ -444,6 +444,251 @@ We'll be learning lots more about broadcasting throughout this book, especially 
 
 We can use `mnist_distance` to figure out whether an image is a 3 or not by using the following logic: if the distance between the digit in question and the ideal 3 is less than the distance to the ideal 7, then it's a 3. This function will automatically do broadcasting and be applied elementwise, just like all Nx functions and operators:
 
+```elixir
+# using anonymous function syntax
+is_3 = fn x -> Nx.less(Chapter4.mnist_distance(x, mean3), Chapter4.mnist_distance(x, mean7)) end
+
+is_3.(a_3)
+```
+
+Note that Nx will convert the Boolean response to an integer, we get `1` for a true value and `0` for false. Thanks to broadcasting, we can also test it on the full validation set of 3s:
+
+```elixir
+is_3.(valid_3_tens)
+```
+
+Now we can calculate the accuracy for each of the 3s and 7s by taking the average of that function for all 3s and its inverse for all 7s:
+
+```elixir
+accuracy_3s = is_3.(valid_3_tens) |> Nx.mean()
+accuracy_7s = Nx.subtract(1, is_3.(valid_7_tens)) |> Nx.mean()
+average_accuracy = Nx.add(accuracy_3s, accuracy_7s) |> Nx.divide(2)
+
+[
+  accuracy_3s,
+  accuracy_7s,
+  average_accuracy
+]
+```
+
+This looks like a pretty good start! We're getting over 90% accuracy on both 3s and 7s, and we've seen how to define a metric conveniently using broadcasting.
+
+But let's be honest: 3s and 7s are very different-looking digits. And we're only classifying 2 out of the 10 possible digits so far. So we're going to need to do better!
+
+To do better, perhaps it is time to try a system that does some real learning—that is, that can automatically modify itself to improve its performance. In other words, it's time to talk about the training process, and SGD.
+
+## Stochastic Gradient Descent (SGD)
+
+Do you remember the way that Arthur Samuel described machine learning, which we quoted in <<chapter_intro>>?
+
+> : Suppose we arrange for some automatic means of testing the effectiveness of any current weight assignment in terms of actual performance and provide a mechanism for altering the weight assignment so as to maximize the performance. We need not go into the details of such a procedure to see that it could be made entirely automatic and to see that a machine so programmed would "learn" from its experience.
+
+As we discussed, this is the key to allowing us to have a model that can get better and better—that can learn. But our pixel similarity approach does not really do this. We do not have any kind of weight assignment, or any way of improving based on testing the effectiveness of a weight assignment. In other words, we can't really improve our pixel similarity approach by modifying a set of parameters. In order to take advantage of the power of deep learning, we will first have to represent our task in the way that Arthur Samuel described it.
+
+Instead of trying to find the similarity between an image and an "ideal image," we could instead look at each individual pixel and come up with a set of weights for each one, such that the highest weights are associated with those pixels most likely to be black for a particular category. For instance, pixels toward the bottom right are not very likely to be activated for a 7, so they should have a low weight for a 7, but they are likely to be activated for an 8, so they should have a high weight for an 8. This can be represented as a function and set of weight values for each possible category—for instance the probability of being the number 8:
+
+```
+defn pr_eight(x,w) do
+  (x*w) |> Nx.sum()
+end
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+Here we are assuming that `x` is the image, represented as a vector—in other words, with all of the rows stacked up end to end into a single long line. And we are assuming that the weights are a vector `w`. If we have this function, then we just need some way to update the weights to make them a little bit better. With such an approach, we can repeat that step a number of times, making the weights better and better, until they are as good as we can make them.
+
+We want to find the specific values for the vector `w` that causes the result of our function to be high for those images that are actually 8s, and low for those images that are not. Searching for the best vector `w` is a way to search for the best function for recognising 8s. (Because we are not yet using a deep neural network, we are limited by what our function can actually do—we are going to fix that constraint later in this chapter.)
+
+To be more specific, here are the steps that we are going to require, to turn this function into a machine learning classifier:
+
+1. *Initialize* the weights.
+2. For each image, use these weights to *predict* whether it appears to be a 3 or a 7.
+3. Based on these predictions, calculate how good the model is (its *loss*).
+4. Calculate the *gradient*, which measures for each weight, how changing that weight would change the loss
+5. *Step* (that is, change) all the weights based on that calculation.
+6. Go back to the step 2, and *repeat* the process.
+7. Iterate until you decide to *stop* the training process (for instance, because the model is good enough or you don't want to wait any longer).
+
+<!-- livebook:{"break_markdown":true} -->
+
+These seven steps, illustrated in <<gradient_descent>>, are the key to the training of all deep learning models. That deep learning turns out to rely entirely on these steps is extremely surprising and counterintuitive. It's amazing that this process can solve such complex problems. But, as you'll see, it really does!
+
+<!-- livebook:{"break_markdown":true} -->
+
+```mermaid
+flowchart LR
+  id1([init]) --> id2([predict])
+  id2 --> id3([loss])
+  id3 --> id4([gradient])
+  id4 --> id5([step])
+  id5 --> id6([stop])
+  id5 -->|repeat| id2
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+There are many different ways to do each of these seven steps, and we will be learning about them throughout the rest of this book. These are the details that make a big difference for deep learning practitioners, but it turns out that the general approach to each one generally follows some basic principles. Here are a few guidelines:
+
+* Initialize:: We initialize the parameters to random values. This may sound surprising. There are certainly other choices we could make, such as initializing them to the percentage of times that pixel is activated for that category—but since we already know that we have a routine to improve these weights, it turns out that just starting with random weights works perfectly well.
+* Loss:: This is what Samuel referred to when he spoke of *testing the effectiveness of any current weight assignment in terms of actual performance*. We need some function that will return a number that is small if the performance of the model is good (the standard approach is to treat a small loss as good, and a large loss as bad, although this is just a convention).
+* Step:: A simple way to figure out whether a weight should be increased a bit, or decreased a bit, would be just to try it: increase the weight by a small amount, and see if the loss goes up or down. Once you find the correct direction, you could then change that amount by a bit more, and a bit less, until you find an amount that works well. However, this is slow! As we will see, the magic of calculus allows us to directly figure out in which direction, and by roughly how much, to change each weight, without having to try all these small changes. The way to do this is by calculating *gradients*. This is just a performance optimization, we would get exactly the same results by using the slower manual process as well.
+* Stop:: Once we've decided how many epochs to train the model for (a few suggestions for this were given in the earlier list), we apply that decision. This is where that decision is applied. For our digit classifier, we would keep training until the accuracy of the model started getting worse, or we ran out of time.
+
+<!-- livebook:{"break_markdown":true} -->
+
+Before applying these steps to our image classification problem, let's illustrate what they look like in a simpler case. First we will define a very simple function, the quadratic—let's pretend that this is our loss function, and `x` is a weight parameter of the function:
+
+```elixir
+f = fn x -> x ** 2 end
+```
+
+Here is a graph of that function:
+
+![](images/graph_fx2.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+The sequence of steps we described earlier starts by picking some random value for a parameter, and calculating the value of the loss:
+![](images/graph_fx2_point.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+Now we look to see what would happen if we increased or decreased our parameter by a little bit—the *adjustment*. This is simply the slope at a particular point:
+
+![](images/grad_illustration.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+We can change our weight by a little in the direction of the slope, calculate our loss and adjustment again, and repeat this a few times. Eventually, we will get to the lowest point on our curve:
+
+![](images/chapter2_perfect.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+This basic idea goes all the way back to Isaac Newton, who pointed out that we can optimize arbitrary functions in this way. Regardless of how complicated our functions become, this basic approach of gradient descent will not significantly change. The only minor changes we will see later in this book are some handy ways we can make it faster, by finding better steps.
+
+## Calculating Gradients
+
+The one magic step is the bit where we calculate the gradients. As we mentioned, we use calculus as a performance optimization; it allows us to more quickly calculate whether our loss will go up or down when we adjust our parameters up or down. In other words, the gradients will tell us how much we have to change each weight to make our model better.
+
+You may remember from your high school calculus class that the *derivative* of a function tells you how much a change in its parameters will change its result. If not, don't worry, lots of us forget calculus once high school is behind us! But you will have to have some intuitive understanding of what a derivative is before you continue, so if this is all very fuzzy in your head, head over to Khan Academy and complete the [lessons on basic derivatives](https://www.khanacademy.org/math/differential-calculus/dc-diff-intro). You won't have to know how to calculate them yourselves, you just have to know what a derivative is.
+
+The key point about a derivative is this: for any function, such as the quadratic function we saw in the previous section, we can calculate its derivative. The derivative is another function. It calculates the change, rather than the value. For instance, the derivative of the quadratic function at the value 3 tells us how rapidly the function changes at the value 3. More specifically, you may recall that gradient is defined as *rise/run*, that is, the change in the value of the function, divided by the change in the value of the parameter. When we know how our function will change, then we know what we need to do to make it smaller. This is the key to machine learning: having a way to change the parameters of a function to make it smaller. Calculus provides us with a computational shortcut, the derivative, which lets us directly calculate the gradients of our functions.
+
+<!-- livebook:{"break_markdown":true} -->
+
+One important thing to be aware of is that our function has lots of weights that we need to adjust, so when we calculate the derivative we won't get back one number, but lots of them—a gradient for every weight. But there is nothing mathematically tricky here; you can calculate the derivative with respect to one weight, and treat all the other ones as constant, then repeat that for each other weight. This is how all of the gradients are calculated, for every weight.
+
+We mentioned just now that you won't have to calculate any gradients yourself. How can that be? Amazingly enough, Nx is able to automatically compute the derivative of nearly any function! What's more, it does it very fast. Most of the time, it will be at least as fast as any derivative function that you can create by hand. Let's see an example.
+
+First, let's pick a tensor value which we want gradients at:
+
+```elixir
+# xt = tensor(3.).requires_grad_()
+xt = Nx.tensor(3)
+```
+
+Now we can define our x**2 function using Nx and then ask Nx to compute the gradient at the point defined in the tensor above.
+
+```elixir
+fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) end)
+fun.(xt)
+```
+
+If you remember your high school calculus rules, the derivative of x**2 is 2 * x, and we have x=3, so the gradients should be 2*3=6, which is what Nx calculated for us!
+
+Now we'll repeat the preceding steps, but with a vector argument for our function:
+
+```elixir
+xt = Nx.tensor([3, 4, 10])
+```
+
+And we'll add `sum` to our function so it can take a vector (i.e., a rank-1 tensor), and return a scalar (i.e., a rank-0 tensor):
+
+```elixir
+fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) |> Nx.sum() end)
+```
+
+Our gradients are 2*xt, as we'd expect!
+
+```elixir
+fun.(xt)
+```
+
+The gradients only tell us the slope of our function, they don't actually tell us exactly how far to adjust the parameters. But it gives us some idea of how far; if the slope is very large, then that may suggest that we have more adjustments to do, whereas if the slope is very small, that may suggest that we are close to the optimal value.
+
+## Stepping With a Learning Rate
+
+Deciding how to change our parameters based on the values of the gradients is an important part of the deep learning process. Nearly all approaches start with the basic idea of multiplying the gradient by some small number, called the *learning rate* (LR). The learning rate is often a number between 0.001 and 0.1, although it could be anything. Often, people select a learning rate just by trying a few, and finding which results in the best model after training (we'll show you a better approach later in this book, called the *learning rate finder*). Once you've picked a learning rate, you can adjust your parameters using this simple function:
+
+```
+w -= gradient(w) * lr
+```
+
+This is known as *stepping* your parameters, using an *optimizer step*. Notice how we _subtract_ the `gradient * lr` from the parameter to update it.  This allows us to adjust the parameter in the direction of the slope by increasing the parameter when the slope is negative and decreasing the parameter when the slope is positive.  We want to adjust our parameters in the direction of the slope because our goal in deep learning is to _minimize_ the loss.
+
+If you pick a learning rate that's too low, it can mean having to do a lot of steps. <<descent_small>> illustrates that.
+
+<!-- livebook:{"break_markdown":true} -->
+
+![](images/chapter2_small.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+But picking a learning rate that's too high is even worse—it can actually result in the loss getting *worse*, as we see in <<descent_div>>!
+
+![](images/chapter2_div.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+If the learning rate is too high, it may also "bounce" around, rather than actually diverging; <> shows how this has the result of taking many steps to train successfully.
+
+![](images/chapter2_bouncy.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+Now let's apply all of this in an end-to-end example.
+
+## An End-to-End SGD Example
+
+We've seen how to use gradients to find a minimum. Now it's time to look at an SGD example and see how finding a minimum can be used to train a model to fit data better.
+
+Let's start with a simple, synthetic, example model. Imagine you were measuring the speed of a roller coaster as it went over the top of a hump. It would start fast, and then get slower as it went up the hill; it would be slowest at the top, and it would then speed up again as it went downhill. You want to build a model of how the speed changes over time. If you were measuring the speed manually every second for 20 seconds, it might look something like this:
+
+```elixir
+time = Nx.iota({20})
+```
+
+```elixir
+# speed = torch.randn(20)*3 + 0.75*(time-9.5)**2 + 1
+
+defmodule Chapter4Again do
+  import Nx.Defn
+
+  defn get_speed(x) do
+    key = Nx.Random.key(42)
+    {randint, _new_key} = Nx.Random.randint(key, 0, 20, shape: x.shape)
+    randint * 3 + 0.75 * (x - 9.5) ** 2 + 1
+  end
+end
+
+speed = Chapter4Again.get_speed(time)
+```
+
+![](images/graph_speed_plot.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+We've added a bit of random noise, since measuring things manually isn't precise. This means it's not that easy to answer the question: what was the roller coaster's speed? Using SGD we can try to find a function that matches our observations. We can't consider every possible function, so let's use a guess that it will be quadratic; i.e., a function of the form a*(time**2)+(b*time)+c.
+
+We want to distinguish clearly between the function's input (the time when we are measuring the coaster's speed) and its parameters (the values that define which quadratic we're trying). So, let's collect the parameters in one argument and thus separate the input, t, and the parameters, params, in the function's signature:
+
+```elixir
+# def f(t, params):
+#     a,b,c = params
+#     return a*(t**2) + (b*t) + c
+```
+
 ## Further Elixir Reading
 
 * NxImage examples - https://hexdocs.pm/nx_image/examples.html
