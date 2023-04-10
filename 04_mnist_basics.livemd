@@ -114,11 +114,11 @@ So, here is a first idea: how about we find the average pixel value for every pi
 
 <!-- livebook:{"break_markdown":true} -->
 
-Step one for our simple model is to get the average of pixel values for each of our two groups. In the process of doing this, we will learn a lot of neat Python numeric programming tricks!
+Step one for our simple model is to get the average of pixel values for each of our two groups. In the process of doing this, we will learn a lot of neat Elixir numeric programming tricks!
 
-Let's create a tensor containing all of our 3s stacked together. We already know how to create a tensor containing a single image. To create a tensor containing all the images in a directory, we will first use a Python list comprehension to create a plain list of the single image tensors.
+Let's create a tensor containing all of our 3s stacked together. We already know how to create a tensor containing a single image. To create a tensor containing all the images in a directory, we will first use `Enum.map` to create a plain list of the single image tensors.
 
-We will use Jupyter to do some little checks of our work along the way—in this case, making sure that the number of returned items seems reasonable:
+We will use Livebook to do some little checks of our work along the way—in this case, making sure that the number of returned items seems reasonable:
 
 ```elixir
 seven_tensors =
@@ -149,7 +149,6 @@ Since we now have tensors (which Livebook by default will print as data), rather
 
 image_tensor = Nx.reshape(hd(three_tensors), {28, 28, 1})
 Kino.Image.new(image_tensor)
-# Kino.Image.new(hd(three_tensors))
 ```
 
 For every pixel position, we want to compute the average over all the images of the intensity of that pixel. To do this we first combine all the images in this list into a single three-dimensional tensor. The most common way to describe such a tensor is to call it a *rank-3 tensor*. We often need to stack up individual tensors in a collection into a single tensor. Unsurprisingly, Nx comes with a function called `stack` that we can use for this purpose.
@@ -316,7 +315,9 @@ In order to apply standard operations like add, subtract, multiply, or divide yo
 Nx.add(tns, 1)
 ```
 
-Or you can use the special Nx.Defn module to create functions which allow you to use standard operators such as +, -, *, or / and many others. This is the primary way these functions are expected to be used.
+Or you can use the special Nx.Defn module to create functions which allow you to use standard operators such as +, -, *, or / and many others.
+
+> BS: **Special Note:** Using Nx.Defn is the idiomatic and cleaner way to right Nx based functions. However, this book will use primarily anonymous functions and explicit Nx function calls in order to follow the flow of the original Fastbook content.
 
 ```elixir
 defmodule Example do
@@ -328,6 +329,16 @@ defmodule Example do
 end
 
 Example.do_some_math(tns)
+```
+
+The anonymous function + explicit Nx function version of the `do_some_math()` above would be:
+
+```elixir
+do_some_math = fn tensor ->
+  Nx.add(tensor, 1)
+end
+
+do_some_math.(tns)
 ```
 
 Tensors will automatically adjust types as needed:
@@ -385,17 +396,13 @@ We ultimately want to write a function, is_3, that will decide if an arbitrary i
 We can write a simple function that calculates the mean absolute error using an expression very similar to the one we wrote in the last section:
 
 ```elixir
-defmodule Chapter4 do
-  import Nx.Defn
-
-  defn mnist_distance(a, b) do
-    (a - b)
-    |> Nx.abs()
-    |> Nx.mean(axes: [-1, -2])
-  end
+mnist_distance = fn a, b ->
+  Nx.subtract(a, b)
+  |> Nx.abs()
+  |> Nx.mean(axes: [-1, -2])
 end
 
-Chapter4.mnist_distance(a_3, mean3)
+mnist_distance.(a_3, mean3)
 ```
 
 This is the same value we previously calculated for the distance between these two images, the ideal 3 mean3 and the arbitrary sample 3 a_3, which are both single-image tensors with a shape of [28,28].
@@ -405,7 +412,7 @@ But in order to calculate a metric for overall accuracy, we will need to calcula
 Something very interesting happens when we take this exact same distance function, designed for comparing two single images, but pass in as an argument valid_3_tens, the tensor that represents the 3s validation set:
 
 ```elixir
-valid_3_dist = Chapter4.mnist_distance(valid_3_tens, mean3)
+valid_3_dist = mnist_distance.(valid_3_tens, mean3)
 [valid_3_dist, valid_3_dist.shape]
 ```
 
@@ -446,7 +453,7 @@ We can use `mnist_distance` to figure out whether an image is a 3 or not by usin
 
 ```elixir
 # using anonymous function syntax
-is_3 = fn x -> Nx.less(Chapter4.mnist_distance(x, mean3), Chapter4.mnist_distance(x, mean7)) end
+is_3 = fn x -> Nx.less(mnist_distance.(x, mean3), mnist_distance.(x, mean7)) end
 
 is_3.(a_3)
 ```
@@ -584,15 +591,15 @@ We mentioned just now that you won't have to calculate any gradients yourself. H
 First, let's pick a tensor value which we want gradients at:
 
 ```elixir
-# xt = tensor(3.).requires_grad_()
 xt = Nx.tensor(3)
 ```
 
 Now we can define our x**2 function using Nx and then ask Nx to compute the gradient at the point defined in the tensor above.
 
 ```elixir
-fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) end)
-fun.(xt)
+f = fn x -> Nx.pow(x, 2) end
+gradient = Nx.Defn.grad(f)
+gradient.(xt)
 ```
 
 If you remember your high school calculus rules, the derivative of x**2 is 2 * x, and we have x=3, so the gradients should be 2*3=6, which is what Nx calculated for us!
@@ -606,13 +613,13 @@ xt = Nx.tensor([3, 4, 10])
 And we'll add `sum` to our function so it can take a vector (i.e., a rank-1 tensor), and return a scalar (i.e., a rank-0 tensor):
 
 ```elixir
-fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) |> Nx.sum() end)
+grad_fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) |> Nx.sum() end)
 ```
 
 Our gradients are 2*xt, as we'd expect!
 
 ```elixir
-fun.(xt)
+grad_fun.(xt)
 ```
 
 The gradients only tell us the slope of our function, they don't actually tell us exactly how far to adjust the parameters. But it gives us some idea of how far; if the slope is very large, then that may suggest that we have more adjustments to do, whereas if the slope is very small, that may suggest that we are close to the optimal value.
@@ -660,19 +667,19 @@ time = Nx.iota({20})
 ```
 
 ```elixir
+# Python
 # speed = torch.randn(20)*3 + 0.75*(time-9.5)**2 + 1
 
-defmodule Chapter4B do
-  import Nx.Defn
+get_speed = fn x ->
+  key = Nx.Random.key(42)
+  {randint, _new_key} = Nx.Random.randint(key, 0, 20, shape: x.shape)
 
-  defn get_speed(x) do
-    key = Nx.Random.key(42)
-    {randint, _new_key} = Nx.Random.randint(key, 0, 20, shape: x.shape)
-    randint * 3 + 0.75 * (x - 9.5) ** 2 + 1
-  end
+  Nx.multiply(randint, 3)
+  |> Nx.add(Nx.multiply(0.75, Nx.pow(Nx.subtract(x, 9.5), 2)))
+  |> Nx.add(1)
 end
 
-speed = Chapter4B.get_speed(time)
+speed = get_speed.(time)
 ```
 
 ![](images/graph_speed_plot.png)
@@ -684,17 +691,12 @@ We've added a bit of random noise, since measuring things manually isn't precise
 We want to distinguish clearly between the function's input (the time when we are measuring the coaster's speed) and its parameters (the values that define which quadratic we're trying). So, let's collect the parameters in one argument and thus separate the input, t, and the parameters, params, in the function's signature:
 
 ```elixir
-# def f(t, params):
-#     a,b,c = params
-#     return a*(t**2) + (b*t) + c
+quadratic = fn time, params ->
+  [a, b, c] = [params[0], params[1], params[2]]
 
-defmodule Chapter4C do
-  import Nx.Defn
-
-  defn f(t, params) do
-    {a, b, c} = params
-    a * t ** 2 + b * t + c
-  end
+  Nx.multiply(a, Nx.pow(time, 2))
+  |> Nx.add(Nx.multiply(b, time))
+  |> Nx.add(c)
 end
 ```
 
@@ -705,6 +707,7 @@ If we can solve this problem for the three parameters of a quadratic function, w
 We need to define first what we mean by "best." We define this precisely by choosing a *loss function*, which will return a value based on a prediction and a target, where lower values of the function correspond to "better" predictions. It is important for loss functions to return _lower_ values when predictions are more accurate, as the SGD procedure we defined earlier will try to _minimize_ this loss. For continuous data, it's common to use *mean squared error*:
 
 ```elixir
+# Python
 # def mse(preds, targets): return ((preds-targets)**2).mean()
 
 mse = fn preds, targets -> Nx.subtract(preds, targets) |> Nx.pow(2) |> Nx.mean() end
@@ -716,7 +719,412 @@ Now, let's work through our 7 step process.
 
 #### Step 1: Initialize the parameters
 
-First, we initialize the parameters to random values, and tell PyTorch that we want to track their gradients, using `requires_grad_`:
+First, we initialize the parameters to random values as a tensor so we can use Nx to manipulate them later:
+
+```elixir
+key = Nx.Random.key(42)
+{rand, _key} = Nx.Random.normal(key, shape: {3})
+
+# Convert to tuple form
+# params = {rand[0], rand[1], rand[2]}
+params = rand
+params = Nx.tensor([-0.7658, -0.7506, 1.3525])
+```
+
+#### Step 2: Calculate the predictions
+
+Next, we calculate the predictions:
+
+```elixir
+preds = quadratic.(time, params)
+```
+
+##### TODO: Figure out how to plot charts in Livebook and graph loss
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Step 3: Calculate the loss
+
+We calculate the loss as follows:
+
+```elixir
+# loss = mse(preds, speed)
+
+loss = mse.(preds, speed)
+```
+
+Our goal is now to improve this. To do that, we'll need to know the gradients.
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Step 4: Calculate the gradients
+
+The next step is to calculate the gradients. `time` and `speed` are our fake observed values so these will be treated as constants here. We will therefore create an anonymous function that takes in our `params` tensor and returns our calculated `loss`.
+
+In other words, calculate an approximation of how the parameters need to change to reduce the loss:
+
+```elixir
+# f = fn t, params -> 
+#     [a, b, c] = [params[0], params[1], params[2]]
+#     # a * (t ** 2) + (b * t) + c
+#     Nx.multiply(a, Nx.pow(t, 2))
+#     |> Nx.add(Nx.multiply(b, t))
+#     |> Nx.add(c)
+# end
+f = fn params ->
+  preds = quadratic.(time, params)
+  mse.(preds, speed)
+end
+
+grad_fun = Nx.Defn.grad(fn p -> f.(p) end)
+gradients = grad_fun.(params)
+```
+
+```elixir
+rate = 0.00001
+Nx.multiply(gradients, rate)
+```
+
+We can use these gradients to improve our parameters. We'll need to pick a learning rate (we'll discuss how to do that in practice in the next chapter; for now we'll just use 1e-5, or 0.00001):
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Step 5: Step the weights
+
+Now we need to update the parameters based on the gradients we just calculated:
+
+```elixir
+params
+```
+
+```elixir
+lr = 0.00001
+params = Nx.subtract(params, Nx.multiply(lr, gradients))
+```
+
+Let's see if the loss has improved:
+
+```elixir
+# preds = f(time,params)
+# mse(preds, speed)
+
+preds = quadratic.(time, params)
+mse.(preds, speed)
+```
+
+We need to repeat this a few times, so we'll create a function to apply one step:
+
+```elixir
+# def apply_step(params, prn=True):
+#     preds = f(time, params)
+#     loss = mse(preds, speed)
+#     loss.backward()
+#     params.data -= lr * params.grad.data
+#     params.grad = None
+#     if prn: print(loss.item())
+#     return preds
+
+f = fn time, speed, pms ->
+  preds = quadratic.(time, pms)
+  mse.(preds, speed)
+end
+
+apply_step = fn params ->
+  preds = quadratic.(time, params)
+  loss = mse.(preds, speed)
+  grad_fun = Nx.Defn.grad(fn p -> f.(time, speed, p) end)
+  gradients = grad_fun.(params)
+  params = Nx.subtract(params, Nx.multiply(lr, gradients))
+  {loss, params}
+end
+
+apply_step.(params)
+```
+
+#### Step 6: Repeat process
+
+Now we iterate. By looping and performing many improvements, we hope to reach a good result:
+
+```elixir
+Enum.reduce(0..9, params, fn i, params ->
+  {loss, new_params} = apply_step.(params)
+  IO.inspect(loss, label: "loss #{i}")
+  new_params
+end)
+```
+
+##### TODO: Is there a better way to loop and update params than using reduce w/ acc above?
+
+<!-- livebook:{"break_markdown":true} -->
+
+##### TODO: Use Livebook plotting to visualize the improvements in the parameters after the 10 iterations of SGD
+
+## Summarizing Gradient Descent
+
+```mermaid
+flowchart LR
+  id1([init]) --> id2([predict])
+  id2 --> id3([loss])
+  id3 --> id4([gradient])
+  id4 --> id5([step])
+  id5 --> id6([stop])
+  id5 -->|repeat| id2
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+To summarize, at the beginning, the weights of our model can be random (training *from scratch*) or come from a pretrained model (*transfer learning*). In the first case, the output we will get from our inputs won't have anything to do with what we want, and even in the second case, it's very likely the pretrained model won't be very good at the specific task we are targeting. So the model will need to *learn* better weights.
+
+We begin by comparing the outputs the model gives us with our targets (we have labeled data, so we know what result the model should give) using a *loss function*, which returns a number that we want to make as low as possible by improving our weights. To do this, we take a few data items (such as images) from the training set and feed them to our model. We compare the corresponding targets using our loss function, and the score we get tells us how wrong our predictions were. We then change the weights a little bit to make it slightly better.
+
+To find how to change the weights to make the loss a bit better, we use calculus to calculate the *gradients*. (Actually, we let PyTorch do it for us!) Let's consider an analogy. Imagine you are lost in the mountains with your car parked at the lowest point. To find your way back to it, you might wander in a random direction, but that probably wouldn't help much. Since you know your vehicle is at the lowest point, you would be better off going downhill. By always taking a step in the direction of the steepest downward slope, you should eventually arrive at your destination. We use the magnitude of the gradient (i.e., the steepness of the slope) to tell us how big a step to take; specifically, we multiply the gradient by a number we choose called the *learning rate* to decide on the step size. We then *iterate* until we have reached the lowest point, which will be our parking lot, then we can *stop*.
+
+All of that we just saw can be transposed directly to the MNIST dataset, except for the loss function. Let's now see how we can define a good training objective.
+
+## The MNIST Loss Function
+
+We already have our independent variables `x`—these are the images themselves. We'll concatenate them all into a single tensor, and also change them from a list of matrices (a rank-3 tensor) to a list of vectors (a rank-2 tensor). We can do this using `reshape()`, which is an Nx method that changes the shape of a tensor without changing its contents. `:auto` is a special parameter to `reshape` that means "make this axis as big as necessary to fit all the data":
+
+```elixir
+# Python
+# train_x = torch.cat([stacked_threes, stacked_sevens]).view(-1, 28*28)
+
+train_x =
+  Nx.concatenate([stacked_threes, stacked_sevens])
+  |> Nx.reshape({:auto, 28 * 28})
+```
+
+We need a label for each image. We'll use `1` for 3s and `0` for 7s:
+
+```elixir
+answers = List.duplicate(1, length(threes)) ++ List.duplicate(0, length(sevens))
+train_y = Nx.tensor(answers) |> Nx.reshape({:auto, 1})
+
+[
+  train_x.shape,
+  train_y.shape
+]
+```
+
+~~A `Dataset` in PyTorch is required to return a tuple of `(x,y)` when indexed. Python provides a `zip` function which, when combined with `list`, provides a simple way to get this functionality:~~
+
+```elixir
+# Python
+# dset = list(zip(train_x,train_y))
+# x,y = dset[0]
+# x.shape,y
+
+dset = [train_x, train_y]
+```
+
+```elixir
+valid_x =
+  Nx.concatenate([valid_3_tens, valid_7_tens])
+  |> Nx.reshape({:auto, 28 * 28})
+
+answers = List.duplicate(1, length(valid_threes)) ++ List.duplicate(0, length(valid_sevens))
+
+valid_y =
+  Nx.tensor(answers)
+  |> Nx.reshape({:auto, 1})
+
+valid_dset = [valid_x, valid_y]
+```
+
+Now we need an (initially random) weight for every pixel (this is the *initialize* step in our seven-step process):
+
+```elixir
+init_params = fn shape ->
+  key = Nx.Random.key(42)
+  {params, _new_key} = Nx.Random.uniform(key, shape: shape)
+  params
+end
+```
+
+```elixir
+weights = init_params.({28 * 28})
+```
+
+The function `weights*pixels` won't be flexible enough—it is always equal to 0 when the pixels are equal to 0 (i.e., its *intercept* is 0). You might remember from high school math that the formula for a line is `y=w*x+b`; we still need the `b`. We'll initialize it to a random number too:
+
+```elixir
+bias = init_params.(1)
+```
+
+In neural networks, the `w` in the equation `y=w*x+b` is called the *weights*, and the `b` is called the *bias*. Together, the weights and bias make up the *parameters*.
+
+> jargon: Parameters: The _weights_ and _biases_ of a model. The weights are the `w` in the equation `w*x+b`, and the biases are the `b` in that equation.
+
+We can now calculate a prediction for one image:
+
+```elixir
+# (train_x[0]*weights.T).sum() + bias
+
+Nx.multiply(train_x[0], weights)
+|> Nx.sum()
+|> Nx.add(bias)
+```
+
+While we could use Elixir to loop through and calculate the prediction for each image, that would be very slow. Because Elixir loops don't run on the GPU we need to represent as much of the computation in a model as possible using higher-level functions.
+
+In this case, there's an extremely convenient mathematical operation that calculates `w*x` for every row of a matrix—it's called *matrix multiplication*. <<matmul>> shows what matrix multiplication looks like.
+
+<!-- livebook:{"break_markdown":true} -->
+
+![](images/matmul2.svg)
+
+<!-- livebook:{"break_markdown":true} -->
+
+This image shows two matrices, `A` and `B`, being multiplied together. Each item of the result, which we'll call `AB`, contains each item of its corresponding row of `A` multiplied by each item of its corresponding column of `B`, added together. For instance, row 1, column 2 (the yellow dot with a red border) is calculated as $a_{1,1} * b_{1,2} + a_{1,2} * b_{2,2}$. If you need a refresher on matrix multiplication, we suggest you take a look at the [Intro to Matrix Multiplication](https://youtu.be/kT4Mp9EdVqs) on *Khan Academy*, since this is the most important mathematical operation in deep learning.
+
+In Python, matrix multiplication is represented with the `@` operator. Let's try it:
+
+```elixir
+linear1 = fn xb ->
+  Nx.dot(xb, weights)
+  |> Nx.add(bias)
+end
+
+preds = linear1.(train_x)
+```
+
+The first element is the same as we calculated before, as we'd expect. This equation which uses `@` to show matrix multiplication, batch@weights + bias, is one of the two fundamental equations of any neural network (the other one is the activation function, which we'll see in a moment).
+
+> BS: In Elixir, we'll use the `Nx.dot()` for matrix multiplication. [See docs](https://hexdocs.pm/nx/Nx.html#dot/2)
+
+Let's check our accuracy. To decide if an output represents a 3 or a 7, we can just check whether it's greater than 0.0, so our accuracy for each item can be calculated (using broadcasting, so no loops!) with:
+
+```elixir
+corrects =
+  Nx.greater(preds, 0)
+  |> Nx.equal(Nx.squeeze(train_y))
+```
+
+```elixir
+Nx.mean(corrects)
+```
+
+Now let's see what the change in accuracy is for a small change in one of the weights ~~(note that we have to ask PyTorch not to calculate gradients as we do this, which is what `with torch.no_grad()` is doing here):~~
+
+```elixir
+weights = Nx.multiply(weights, 1.0001)
+
+linear1 = fn xb ->
+  Nx.dot(xb, weights)
+  |> Nx.add(bias)
+end
+
+preds = linear1.(train_x)
+
+Nx.greater(preds, 0)
+|> Nx.equal(Nx.squeeze(train_y))
+|> Nx.mean()
+```
+
+As we've seen, we need gradients in order to improve our model using SGD, and in order to calculate gradients we need some *loss function* that represents how good our model is. That is because the gradients are a measure of how that loss function changes with small tweaks to the weights.
+
+So, we need to choose a loss function. The obvious approach would be to use accuracy, which is our metric, as our loss function as well. In this case, we would calculate our prediction for each image, collect these values to calculate an overall accuracy, and then calculate the gradients of each weight with respect to that overall accuracy.
+
+Unfortunately, we have a significant technical problem here. The gradient of a function is its *slope*, or its steepness, which can be defined as *rise over run*—that is, how much the value of the function goes up or down, divided by how much we changed the input. We can write this in mathematically as: `(y_new - y_old) / (x_new - x_old)`. This gives us a good approximation of the gradient when `x_new` is very similar to `x_old`, meaning that their difference is very small. But accuracy only changes at all when a prediction changes from a 3 to a 7, or vice versa. The problem is that a small change in weights from `x_old` to `x_new` isn't likely to cause any prediction to change, so `(y_new - y_old)` will almost always be 0. In other words, the gradient is 0 almost everywhere.
+
+<!-- livebook:{"break_markdown":true} -->
+
+A very small change in the value of a weight will often not actually change the accuracy at all. This means it is not useful to use accuracy as a loss function—if we do, most of the time our gradients will actually be 0, and the model will not be able to learn from that number.
+
+> S: In mathematical terms, accuracy is a function that is constant almost everywhere (except at the threshold, 0.5), so its derivative is nil almost everywhere (and infinity at the threshold). This then gives gradients that are 0 or infinite, which are useless for updating the model.
+
+Instead, we need a loss function which, when our weights result in slightly better predictions, gives us a slightly better loss. So what does a "slightly better prediction" look like, exactly? Well, in this case, it means that if the correct answer is a 3 the score is a little higher, or if the correct answer is a 7 the score is a little lower.
+
+Let's write such a function now. What form does it take?
+
+The loss function receives not the images themselves, but the predictions from the model. Let's make one argument, `prds`, of values between 0 and 1, where each value is the prediction that an image is a 3. It is a vector (i.e., a rank-1 tensor), indexed over the images.
+
+The purpose of the loss function is to measure the difference between predicted values and the true values — that is, the targets (aka labels). Let's make another argument, `trgts`, with values of 0 or 1 which tells whether an image actually is a 3 or not. It is also a vector (i.e., another rank-1 tensor), indexed over the images.
+
+So, for instance, suppose we had three images which we knew were a 3, a 7, and a 3. And suppose our model predicted with high confidence (`0.9`) that the first was a 3, with slight confidence (`0.4`) that the second was a 7, and with fair confidence (`0.2`), but incorrectly, that the last was a 7. This would mean our loss function would receive these values as its inputs:
+
+```elixir
+trgts = Nx.tensor([1, 0, 1])
+prds = Nx.tensor([0.9, 0.4, 0.2])
+```
+
+Here's a first try at a loss function that measures the distance between `predictions` and `targets`:
+
+```elixir
+# Python
+# def mnist_loss(predictions, targets):
+#     return torch.where(targets==1, 1-predictions, predictions).mean()
+
+mnist_loss = fn predictions, targets ->
+  Nx.subtract(predictions, targets)
+  |> Nx.abs()
+  |> Nx.mean()
+end
+```
+
+> BS: This deviates from the method used in the Python book but results in the same tensor with simply using a `subtract()` and `abs()` which will give us the distance between our predictions and correct values.
+
+```elixir
+# torch.where(trgts==1, 1-prds, prds)
+# tensor([0.1000, 0.4000, 0.8000])
+
+Nx.subtract(prds, trgts) |> Nx.abs()
+```
+
+You can see that this function returns a lower number when predictions are more accurate, when accurate predictions are more confident (higher absolute values), and when inaccurate predictions are less confident. In Nx, we always assume that a lower value of a loss function is better. Since we need a scalar for the final loss, `mnist_loss` takes the mean of the previous tensor:
+
+```elixir
+mnist_loss.(prds, trgts)
+```
+
+For instance, if we change our prediction for the one "false" target from `0.2` to `0.8` the loss will go down, indicating that this is a better prediction:
+
+```elixir
+mnist_loss.(Nx.tensor([0.9, 0.4, 0.8]), trgts)
+```
+
+One problem with `mnist_loss` as currently defined is that it assumes that predictions are always between 0 and 1. We need to ensure, then, that this is actually the case! As it happens, there is a function that does exactly that—let's take a look.
+
+## Sigmoid
+
+The `sigmoid` function always outputs a number between 0 and 1. It's defined as follows:
+
+```elixir
+# Python
+# def sigmoid(x): return 1/(1+torch.exp(-x))
+
+sigmoid = fn x -> Nx.divide(1, Nx.add(1, Nx.exp(-x))) end
+```
+
+Nx defines an accelerated version for us, so we don’t really need our own. This is an important function in deep learning, since we often want to ensure values are between 0 and 1. This is what it looks like:
+
+![](images/sigmoid.png)
+
+As you can see, it takes any input value, positive or negative, and smooshes it onto an output value between 0 and 1. It's also a smooth curve that only goes up, which makes it easier for SGD to find meaningful gradients.
+
+Let's update `mnist_loss` to first apply `sigmoid` to the inputs:
+
+```elixir
+# def mnist_loss(predictions, targets):
+#     predictions = predictions.sigmoid()
+#     return torch.where(targets==1, 1-predictions, predictions).mean()
+
+mnist_loss = fn predictions, targets ->
+  predictions = Nx.sigmoid(predictions)
+
+  Nx.subtract(targets, predictions)
+  |> Nx.abs()
+  |> Nx.mean()
+end
+```
+
+Now we can be confident our loss function will work, even if the predictions are not between 0 and 1. All that is required is that a higher prediction corresponds to higher confidence an image is a 3.
+
+Having defined a loss function, now is a good moment to recapitulate why we did this. After all, we already had a metric, which was overall accuracy. So why did we define a loss?
+
+The key difference is that the metric is to drive human understanding and the loss is to drive automated learning. To drive automated learning, the loss must be a function that has a meaningful derivative. It can't have big flat sections and large jumps, but instead must be reasonably smooth. This is why we designed a loss function that would respond to small changes in confidence level. This requirement means that sometimes it does not really reflect exactly what we are trying to achieve, but is rather a compromise between our real goal and a function that can be optimized using its gradient. The loss function is calculated for each item in our dataset, and then at the end of an epoch the loss values are all averaged and the overall mean is reported for the epoch.
+
+Metrics, on the other hand, are the numbers that we really care about. These are the values that are printed at the end of each epoch that tell us how our model is really doing. It is important that we learn to focus on these metrics, rather than the loss, when judging the performance of a model.
 
 ## Further Elixir Reading
 
