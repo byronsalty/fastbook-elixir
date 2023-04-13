@@ -10,6 +10,12 @@ This version of the book is intended to be an introduction to AI using the same 
 
 As part of that transition we will also move from Jupyter Notebooks to Elixir's Livebooks.
 
+## Organization
+
+The original Python Fastbook organized it's notebooks into the full versions by default which included code and textual explanations, as well as a subdirectory `/clean` which contained versions of the notebooks with only the code.
+
+This repository will follow the same convention as well as add a `/vs_python` subdirectory that will be a "clean" version of the notebooks that also includes the original python code in case the comparison helps anyone reading this book who has a familiarity with Python and it's AI frameworks.
+
 ## Expectations
 
 This is intended to follow the original work as closely as possible but I expect that there will be many areas where Elixir does not have the same capabilities as the very mature Python+ML/AI stacks.
@@ -22,6 +28,10 @@ Where possible this book should skew toward readability. Specifically there are 
 
 * The original pythonic Fastbook has parts / libraries that make things very easy but at times abstract too much detail. Some of these areas might result in more code in the Elixir version for clarity reasons.
 * I will not opt for the smallest Elixir code possible, sometimes instead breaking things into extra steps for the purpose of clarity.
+
+<!-- livebook:{"break_markdown":true} -->
+
+> BS: Tip for Reading. These chapters are generally very long. Utilize the 'Sections' feature of Livebook on the left-nav to keep track of where you are and jump around as needed to refresh.
 
 ## Additional Learning Opportunities
 

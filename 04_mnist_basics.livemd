@@ -4,11 +4,13 @@
 Mix.install([
   {:jason, "~> 1.4"},
   {:kino, "~> 0.8.0", override: true},
+  {:kino_vega_lite, "~> 0.1.8"},
   {:image, "~> 0.28.1"},
   {:nx, "~> 0.4"},
   {:nx_image, "~> 0.1.1"},
   {:bumblebee, "~> 0.1"},
-  {:explorer, "~> 0.5.1"},
+  {:explorer, "~> 0.5.6"},
+  {:kino_explorer, "~> 0.1.2"},
   {:exla, "~> 0.4"},
   {:fastbook_elixir, path: "lib/fastbook_elixir"},
   {:httpoison, "~> 1.8"},
@@ -41,6 +43,11 @@ Geoff Hinton has told of how even academic papers showing dramatically better re
 In addition to these three Turing Award winners, there are many other researchers who have battled to get us to where we are today. For instance, Jurgen Schmidhuber (who many believe should have shared in the Turing Award) pioneered many important ideas, including working with his student Sepp Hochreiter on the long short-term memory (LSTM) architecture (widely used for speech recognition and other text modeling tasks, and used in the IMDb example in <>). Perhaps most important of all, Paul Werbos in 1974 invented back-propagation for neural networks, the technique shown in this chapter and used universally for training neural networks (Werbos 1994). His development was almost entirely ignored for decades, but today it is considered the most important foundation of modern AI.
 
 There is a lesson here for all of us! On your deep learning journey you will face many obstacles, both technical, and (even more difficult) posed by people around you who don't believe you'll be successful. There's one guaranteed way to fail, and that's to stop trying. We've seen that the only consistent trait amongst every fast.ai student that's gone on to be a world-class practitioner is that they are all very tenacious.
+
+```elixir
+mat = Nx.tensor([[1, 2], [3, 4]], names: [:y, :x])
+mat[x: -1]
+```
 
 ## 3s and 7s Classifier
 
@@ -598,8 +605,7 @@ Now we can define our x**2 function using Nx and then ask Nx to compute the grad
 
 ```elixir
 f = fn x -> Nx.pow(x, 2) end
-gradient = Nx.Defn.grad(f)
-gradient.(xt)
+gradient = Nx.Defn.grad(f).(xt)
 ```
 
 If you remember your high school calculus rules, the derivative of x**2 is 2 * x, and we have x=3, so the gradients should be 2*3=6, which is what Nx calculated for us!
@@ -613,13 +619,29 @@ xt = Nx.tensor([3, 4, 10])
 And we'll add `sum` to our function so it can take a vector (i.e., a rank-1 tensor), and return a scalar (i.e., a rank-0 tensor):
 
 ```elixir
-grad_fun = Nx.Defn.grad(fn x -> Nx.pow(x, 2) |> Nx.sum() end)
+grad_func = Nx.Defn.grad(fn x -> Nx.pow(x, 2) |> Nx.sum() end)
+```
+
+```elixir
+xt = Nx.tensor([3, 4, 10])
+
+fx = fn x ->
+  IO.puts("I'm running")
+  Nx.pow(x, 2) |> Nx.sum()
+end
+
+dxdt = Nx.Defn.grad(fx)
+
+[
+  fx.(xt),
+  dxdt.(xt)
+]
 ```
 
 Our gradients are 2*xt, as we'd expect!
 
 ```elixir
-grad_fun.(xt)
+grad_func.(xt)
 ```
 
 The gradients only tell us the slope of our function, they don't actually tell us exactly how far to adjust the parameters. But it gives us some idea of how far; if the slope is very large, then that may suggest that we have more adjustments to do, whereas if the slope is very small, that may suggest that we are close to the optimal value.
@@ -665,6 +687,12 @@ Let's start with a simple, synthetic, example model. Imagine you were measuring 
 ```elixir
 time = Nx.iota({20})
 ```
+
+> BS: Here we used the `iota()` creation function which returns a tensor of a given shape with values from an increasing index by default.
+
+<!-- livebook:{"break_markdown":true} -->
+
+Function simply used to create fake "actual" data for the next example.
 
 ```elixir
 # Python
@@ -725,10 +753,7 @@ First, we initialize the parameters to random values as a tensor so we can use N
 key = Nx.Random.key(42)
 {rand, _key} = Nx.Random.normal(key, shape: {3})
 
-# Convert to tuple form
-# params = {rand[0], rand[1], rand[2]}
 params = rand
-params = Nx.tensor([-0.7658, -0.7506, 1.3525])
 ```
 
 #### Step 2: Calculate the predictions
@@ -748,6 +773,7 @@ preds = quadratic.(time, params)
 We calculate the loss as follows:
 
 ```elixir
+# Python
 # loss = mse(preds, speed)
 
 loss = mse.(preds, speed)
@@ -764,20 +790,12 @@ The next step is to calculate the gradients. `time` and `speed` are our fake obs
 In other words, calculate an approximation of how the parameters need to change to reduce the loss:
 
 ```elixir
-# f = fn t, params -> 
-#     [a, b, c] = [params[0], params[1], params[2]]
-#     # a * (t ** 2) + (b * t) + c
-#     Nx.multiply(a, Nx.pow(t, 2))
-#     |> Nx.add(Nx.multiply(b, t))
-#     |> Nx.add(c)
-# end
 f = fn params ->
   preds = quadratic.(time, params)
   mse.(preds, speed)
 end
 
-grad_fun = Nx.Defn.grad(fn p -> f.(p) end)
-gradients = grad_fun.(params)
+gradients = Nx.Defn.grad(fn p -> f.(p) end).(params)
 ```
 
 ```elixir
@@ -792,10 +810,6 @@ We can use these gradients to improve our parameters. We'll need to pick a learn
 #### Step 5: Step the weights
 
 Now we need to update the parameters based on the gradients we just calculated:
-
-```elixir
-params
-```
 
 ```elixir
 lr = 0.00001
@@ -815,6 +829,7 @@ mse.(preds, speed)
 We need to repeat this a few times, so we'll create a function to apply one step:
 
 ```elixir
+# Python
 # def apply_step(params, prn=True):
 #     preds = f(time, params)
 #     loss = mse(preds, speed)
@@ -832,8 +847,8 @@ end
 apply_step = fn params ->
   preds = quadratic.(time, params)
   loss = mse.(preds, speed)
-  grad_fun = Nx.Defn.grad(fn p -> f.(time, speed, p) end)
-  gradients = grad_fun.(params)
+  grad_func = Nx.Defn.grad(fn p -> f.(time, speed, p) end)
+  gradients = grad_func.(params)
   params = Nx.subtract(params, Nx.multiply(lr, gradients))
   {loss, params}
 end
@@ -846,11 +861,14 @@ apply_step.(params)
 Now we iterate. By looping and performing many improvements, we hope to reach a good result:
 
 ```elixir
-Enum.reduce(0..9, params, fn i, params ->
-  {loss, new_params} = apply_step.(params)
-  IO.inspect(loss, label: "loss #{i}")
-  new_params
-end)
+# for i in range(10): apply_step(params)
+
+params =
+  Enum.reduce(0..9, params, fn i, params ->
+    {loss, new_params} = apply_step.(params)
+    IO.inspect(loss, label: "loss #{i}")
+    new_params
+  end)
 ```
 
 ##### TODO: Is there a better way to loop and update params than using reduce w/ acc above?
@@ -915,6 +933,7 @@ train_y = Nx.tensor(answers) |> Nx.reshape({:auto, 1})
 # x.shape,y
 
 dset = [train_x, train_y]
+:ok
 ```
 
 ```elixir
@@ -924,9 +943,7 @@ valid_x =
 
 answers = List.duplicate(1, length(valid_threes)) ++ List.duplicate(0, length(valid_sevens))
 
-valid_y =
-  Nx.tensor(answers)
-  |> Nx.reshape({:auto, 1})
+valid_y = Nx.tensor(answers) |> Nx.reshape({:auto, 1})
 
 valid_dset = [valid_x, valid_y]
 ```
@@ -936,7 +953,7 @@ Now we need an (initially random) weight for every pixel (this is the *initializ
 ```elixir
 init_params = fn shape ->
   key = Nx.Random.key(42)
-  {params, _new_key} = Nx.Random.uniform(key, shape: shape)
+  {params, _new_key} = Nx.Random.normal(key, shape: shape)
   params
 end
 ```
@@ -948,7 +965,7 @@ weights = init_params.({28 * 28})
 The function `weights*pixels` won't be flexible enough—it is always equal to 0 when the pixels are equal to 0 (i.e., its *intercept* is 0). You might remember from high school math that the formula for a line is `y=w*x+b`; we still need the `b`. We'll initialize it to a random number too:
 
 ```elixir
-bias = init_params.(1)
+bias = init_params.({1})
 ```
 
 In neural networks, the `w` in the equation `y=w*x+b` is called the *weights*, and the `b` is called the *bias*. Together, the weights and bias make up the *parameters*.
@@ -977,7 +994,7 @@ In this case, there's an extremely convenient mathematical operation that calcul
 
 This image shows two matrices, `A` and `B`, being multiplied together. Each item of the result, which we'll call `AB`, contains each item of its corresponding row of `A` multiplied by each item of its corresponding column of `B`, added together. For instance, row 1, column 2 (the yellow dot with a red border) is calculated as $a_{1,1} * b_{1,2} + a_{1,2} * b_{2,2}$. If you need a refresher on matrix multiplication, we suggest you take a look at the [Intro to Matrix Multiplication](https://youtu.be/kT4Mp9EdVqs) on *Khan Academy*, since this is the most important mathematical operation in deep learning.
 
-In Python, matrix multiplication is represented with the `@` operator. Let's try it:
+Let's try it:
 
 ```elixir
 linear1 = fn xb ->
@@ -988,7 +1005,7 @@ end
 preds = linear1.(train_x)
 ```
 
-The first element is the same as we calculated before, as we'd expect. This equation which uses `@` to show matrix multiplication, batch@weights + bias, is one of the two fundamental equations of any neural network (the other one is the activation function, which we'll see in a moment).
+The first element is the same as we calculated before, as we'd expect. This equation which uses matrix multiplication (shown with the `@` operator from Python), batch@weights + bias, is one of the two fundamental equations of any neural network (the other one is the activation function, which we'll see in a moment).
 
 > BS: In Elixir, we'll use the `Nx.dot()` for matrix multiplication. [See docs](https://hexdocs.pm/nx/Nx.html#dot/2)
 
@@ -998,13 +1015,11 @@ Let's check our accuracy. To decide if an output represents a 3 or a 7, we can j
 corrects =
   Nx.greater(preds, 0)
   |> Nx.equal(Nx.squeeze(train_y))
-```
 
-```elixir
 Nx.mean(corrects)
 ```
 
-Now let's see what the change in accuracy is for a small change in one of the weights ~~(note that we have to ask PyTorch not to calculate gradients as we do this, which is what `with torch.no_grad()` is doing here):~~
+Now let's see what the change in accuracy is for a small change in one of the weights:
 
 ```elixir
 weights = Nx.multiply(weights, 1.0001)
@@ -1015,10 +1030,9 @@ linear1 = fn xb ->
 end
 
 preds = linear1.(train_x)
+corrects = Nx.greater(preds, 0) |> Nx.equal(Nx.squeeze(train_y))
 
-Nx.greater(preds, 0)
-|> Nx.equal(Nx.squeeze(train_y))
-|> Nx.mean()
+Nx.mean(corrects)
 ```
 
 As we've seen, we need gradients in order to improve our model using SGD, and in order to calculate gradients we need some *loss function* that represents how good our model is. That is because the gradients are a measure of how that loss function changes with small tweaks to the weights.
@@ -1056,19 +1070,13 @@ Here's a first try at a loss function that measures the distance between `predic
 #     return torch.where(targets==1, 1-predictions, predictions).mean()
 
 mnist_loss = fn predictions, targets ->
-  Nx.subtract(predictions, targets)
-  |> Nx.abs()
+  Nx.select(Nx.equal(targets, 1), Nx.subtract(1, predictions), predictions)
   |> Nx.mean()
 end
 ```
 
-> BS: This deviates from the method used in the Python book but results in the same tensor with simply using a `subtract()` and `abs()` which will give us the distance between our predictions and correct values.
-
 ```elixir
-# torch.where(trgts==1, 1-prds, prds)
-# tensor([0.1000, 0.4000, 0.8000])
-
-Nx.subtract(prds, trgts) |> Nx.abs()
+Nx.select(Nx.equal(trgts, 1), Nx.subtract(1, prds), prds)
 ```
 
 You can see that this function returns a lower number when predictions are more accurate, when accurate predictions are more confident (higher absolute values), and when inaccurate predictions are less confident. In Nx, we always assume that a lower value of a loss function is better. Since we need a scalar for the final loss, `mnist_loss` takes the mean of the previous tensor:
@@ -1112,8 +1120,7 @@ Let's update `mnist_loss` to first apply `sigmoid` to the inputs:
 mnist_loss = fn predictions, targets ->
   predictions = Nx.sigmoid(predictions)
 
-  Nx.subtract(targets, predictions)
-  |> Nx.abs()
+  Nx.select(Nx.equal(Nx.squeeze(targets), 1), Nx.subtract(1, predictions), predictions)
   |> Nx.mean()
 end
 ```
@@ -1125,6 +1132,276 @@ Having defined a loss function, now is a good moment to recapitulate why we did 
 The key difference is that the metric is to drive human understanding and the loss is to drive automated learning. To drive automated learning, the loss must be a function that has a meaningful derivative. It can't have big flat sections and large jumps, but instead must be reasonably smooth. This is why we designed a loss function that would respond to small changes in confidence level. This requirement means that sometimes it does not really reflect exactly what we are trying to achieve, but is rather a compromise between our real goal and a function that can be optimized using its gradient. The loss function is calculated for each item in our dataset, and then at the end of an epoch the loss values are all averaged and the overall mean is reported for the epoch.
 
 Metrics, on the other hand, are the numbers that we really care about. These are the values that are printed at the end of each epoch that tell us how our model is really doing. It is important that we learn to focus on these metrics, rather than the loss, when judging the performance of a model.
+
+## SGD and Mini-Batches
+
+Now that we have a loss function that is suitable for driving SGD, we can consider some of the details involved in the next phase of the learning process, which is to change or update the weights based on the gradients. This is called an *optimization step*.
+
+In order to take an optimization step we need to calculate the loss over one or more data items. How many should we use? We could calculate it for the whole dataset, and take the average, or we could calculate it for a single data item. But neither of these is ideal. Calculating it for the whole dataset would take a very long time. Calculating it for a single item would not use much information, so it would result in a very imprecise and unstable gradient. That is, you'd be going to the trouble of updating the weights, but taking into account only how that would improve the model's performance on that single item.
+
+So instead we take a compromise between the two: we calculate the average loss for a few data items at a time. This is called a *mini-batch*. The number of data items in the mini-batch is called the *batch size*. A larger batch size means that you will get a more accurate and stable estimate of your dataset's gradients from the loss function, but it will take longer, and you will process fewer mini-batches per epoch. Choosing a good batch size is one of the decisions you need to make as a deep learning practitioner to train your model quickly and accurately. We will talk about how to make this choice throughout this book.
+
+Another good reason for using mini-batches rather than calculating the gradient on individual data items is that, in practice, we nearly always do our training on an accelerator such as a GPU. These accelerators only perform well if they have lots of work to do at a time, so it's helpful if we can give them lots of data items to work on. Using mini-batches is one of the best ways to do this. However, if you give them too much data to work on at once, they run out of memory—making GPUs happy is also tricky!
+
+As we saw in our discussion of data augmentation in <<chapter_production>>, we get better generalization if we can vary things during training. One simple and effective thing we can vary is what data items we put in each mini-batch. Rather than simply enumerating our dataset in order for every epoch, instead what we normally do is randomly shuffle it on every epoch, before we create mini-batches. ~~PyTorch and fastai provide a class that will do the shuffling and mini-batch collation for you, called `DataLoader`.~~
+
+~~A `DataLoader` can take any Python collection and turn it into an iterator over mini-batches, like so:~~
+
+```elixir
+# coll = range(15)
+# dl = DataLoader(coll, batch_size=5, shuffle=True)
+# list(dl)
+
+key = Nx.Random.key(42)
+
+{shuffled, _new_key} = Nx.Random.shuffle(key, Nx.iota({15}))
+
+shuffled |> Nx.to_batched(5) |> Enum.to_list()
+```
+
+For training a model, we don't just want any collection, but a collection containing independent and dependent variables (that is, the inputs and targets of the model). A collection that contains tuples of independent and dependent variables is known as a `Dataset`. Here's an example of an extremely simple `Dataset`:
+
+<!-- livebook:{"break_markdown":true} -->
+
+##### TODO: Section with Dataloader and alphabet
+
+## Putting It All Together
+
+It's time to implement the process we saw in <<gradient_descent>>. In code, our process will be implemented something like this for each epoch:
+
+```
+# Pseudo-code for understandability
+
+for inputs,outputs in steps:
+    preds = model(params, inputs)
+    loss = loss_func(preds, outputs)
+    gradients = grad_func(params)
+    params = params - (gradients * learning_rate)
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+First, let's re-initialize our parameters:
+
+```elixir
+[
+  weights = init_params.({28 * 28}),
+  bias = init_params.({1})
+]
+```
+
+And redefine our `linear1` function to use `weights` and `bias` as input:
+
+```elixir
+linear1 = fn xb, weights, bias ->
+  Nx.dot(xb, weights)
+  |> Nx.add(bias)
+end
+```
+
+~~A `DataLoader` can be created from a `Dataset`:~~
+
+##### Let's get a Image data ready for batches
+
+Let's look at our image set data:
+
+```elixir
+# Python
+# dl = DataLoader(dset, batch_size=256)
+# xb,yb = first(dl)
+# xb.shape,yb.shape
+
+# dset = Explorer.DataFrame.new(x: train_x, y: train_y)
+
+dl =
+  [
+    train_x |> Nx.to_batched(256) |> Enum.to_list(),
+    train_y |> Nx.to_batched(256) |> Enum.to_list()
+  ]
+  |> Enum.zip()
+
+{xb, yb} = hd(dl)
+[xb.shape, yb.shape]
+```
+
+We'll do the same for the validation set:
+
+```elixir
+valid_dl =
+  [
+    valid_x |> Nx.to_batched(256) |> Enum.to_list(),
+    valid_y |> Nx.to_batched(256) |> Enum.to_list()
+  ]
+  |> Enum.zip()
+```
+
+##### But first let's test a few things out with a small batch
+
+Let's create a mini-batch of size 4 for testing:
+
+```elixir
+# Todo - because these aren't shuffled we're getting all of the same type and will be all correct or all incorrect
+
+batch = train_x[6129..6132]
+batch.shape
+```
+
+```elixir
+preds = linear1.(batch, weights, bias)
+preds
+```
+
+```elixir
+answers = Nx.squeeze(train_y[6129..6132])
+loss = mnist_loss.(preds, answers)
+loss
+```
+
+Now we can calculate the gradients:
+
+```elixir
+# loss.backward()
+# weights.grad.shape,weights.grad.mean(),bias.grad
+
+f = fn images, answers, params ->
+  {weights, bias} = params
+  preds = linear1.(images, weights, bias)
+  mnist_loss.(preds, answers)
+end
+
+params = {weights, bias}
+
+gradients = Nx.Defn.grad(fn p -> f.(batch, answers, p) end).(params)
+```
+
+Let's put that all in a function:
+
+```elixir
+# def calc_grad(xb, yb, model):
+#     preds = model(xb)
+#     loss = mnist_loss(preds, yb)
+#     loss.backward()
+
+calc_grad = fn xb, yb, params ->
+  # {weights, bias} = params
+  # preds = linear1.(xb, weights, bias)
+  # mnist_loss.(preds, yb)
+  Nx.Defn.grad(fn p -> f.(xb, yb, p) end).(params)
+end
+```
+
+and test it:
+
+```elixir
+# calc_grad(batch, train_y[:4], linear1)
+# weights.grad.mean(),bias.grad
+
+calc_grad.(batch, answers, {weights, bias})
+```
+
+Our only remaining step is to update the weights and biases based on the gradient and learning rate. Here's our basic training loop for an epoch:
+
+```elixir
+# def train_epoch(model, lr, params):
+#     for xb,yb in dl:
+#         calc_grad(xb, yb, model)
+#         for p in params:
+#             p.data -= p.grad*lr
+#             p.grad.zero_()
+
+train_epoch = fn data, lr, params ->
+  Enum.reduce(data, params, fn {xb, yb}, params ->
+    {weight, bias} = params
+
+    {w_gradient, b_gradient} = Nx.Defn.grad(fn p -> f.(xb, yb, p) end).(params)
+
+    {
+      Nx.subtract(weight, Nx.multiply(lr, w_gradient)),
+      Nx.subtract(bias, Nx.multiply(lr, b_gradient))
+    }
+  end)
+end
+```
+
+> BS: The Python versions of this code use global variables and changing values outside of the explicit scope of the functions. This is hard to read and thankfully Elixir does not allow this, but it will result in our code being more verbose.
+
+```elixir
+range = 6120..6140
+
+batch_x = train_x[range]
+batch_y = train_y[range]
+:ok
+```
+
+```elixir
+lr = 1.0
+params = {weights, bias}
+params = train_epoch.(dl, lr, params)
+```
+
+```elixir
+# Python
+# def batch_accuracy(xb, yb):
+#     preds = xb.sigmoid()
+#     correct = (preds>0.5) == yb
+#     return correct.float().mean()
+
+batch_accuracy = fn xb, yb ->
+  preds = Nx.sigmoid(xb)
+  correct = Nx.greater(preds, 0.5) |> Nx.equal(yb)
+  Nx.mean(correct)
+end
+```
+
+```elixir
+# def validate_epoch(model):
+#     accs = [batch_accuracy(model(xb), yb) for xb,yb in valid_dl]
+#     return round(torch.stack(accs).mean().item(), 4)
+validate_epoch = fn valid_dl, model ->
+  accs =
+    Enum.map(valid_dl, fn {xb, yb} ->
+      batch_accuracy.(model.(xb), yb)
+    end)
+
+  Nx.stack(accs) |> Nx.mean()
+end
+
+model = fn xb -> linear1.(xb, weights, bias) end
+validate_epoch.(valid_dl, model)
+```
+
+That's our starting point. Let's train for one epoch, and see if the accuracy improves:
+
+```elixir
+params = {weights, bias}
+{weights, bias} = train_epoch.(dl, lr, params)
+
+model = fn xb -> linear1.(xb, weights, bias) end
+validate_epoch.(valid_dl, model)
+```
+
+Awesome!
+
+<!-- livebook:{"break_markdown":true} -->
+
+Then do a few more:
+
+```elixir
+# for i in range(20):
+#     train_epoch(linear1, lr, params)
+#     print(validate_epoch(linear1), end=' ')
+params = {weights, bias}
+
+Enum.reduce(0..4, params, fn _, params ->
+  {weights, bias} = train_epoch.(dl, lr, params)
+
+  model = fn xb -> linear1.(xb, weights, bias) end
+  IO.inspect(validate_epoch.(valid_dl, model), label: "latest epoch")
+  {weights, bias}
+end)
+```
+
+Looking good! We're already about at the same accuracy as our "pixel similarity" approach, and we've created a general-purpose foundation we can build on. Our next step will be to create an object that will handle the SGD step for us. ~~In PyTorch, it's called an optimizer.~~
 
 ## Further Elixir Reading
 
