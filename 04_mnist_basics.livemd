@@ -6,7 +6,7 @@ Mix.install([
   {:kino, "~> 0.8.0", override: true},
   {:kino_vega_lite, "~> 0.1.8"},
   {:image, "~> 0.28.1"},
-  {:nx, "~> 0.4"},
+  {:nx, "~> 0.5.3"},
   {:nx_image, "~> 0.1.1"},
   {:bumblebee, "~> 0.1"},
   {:explorer, "~> 0.5.6"},
@@ -14,8 +14,11 @@ Mix.install([
   {:exla, "~> 0.4"},
   {:fastbook_elixir, path: "lib/fastbook_elixir"},
   {:httpoison, "~> 1.8"},
-  {:poison, "~> 5.0"}
+  {:poison, "~> 5.0"},
+  {:axon, "~> 0.5.1"}
 ])
+
+# Nx.Defn.default_options(compiler: EXLA)
 
 alias FastbookElixir.URLs
 ```
@@ -261,16 +264,19 @@ In both cases, the distance between our 3 and the "ideal" 3 is less than the dis
 
 <!-- livebook:{"break_markdown":true} -->
 
-**TODO:** Are there similar built-in functions for loss in any of the Elixir libraries?
-
-~~PyTorch already provides both of these as *loss functions*. You'll find these inside `torch.nn.functional`, which the PyTorch team recommends importing as `F` (and is available by default under that name in fastai):~~
+Elixir's Axon library already provides both of these as *loss functions*. You'll find these inside `Axon.Losses`:
 
 ```elixir
 # The python code
 # F.l1_loss(a_3.float(),mean7), F.mse_loss(a_3,mean7).sqrt()
+
+[
+  Axon.Losses.mean_absolute_error(a_3, mean7) |> Nx.mean(),
+  Axon.Losses.mean_squared_error(a_3, mean7) |> Nx.mean() |> Nx.sqrt()
+]
 ```
 
-Here `mse` stands for *mean squared error*, and `l1` refers to the standard mathematical jargon for *mean absolute value* (in math it's called the *L1 norm*).
+Note that *mean squared error* is often abbreviated as `mse`, and *mean absolute error* is sometimes called `l1` refers to the standard mathematical jargon for (in math it's called the *L1 norm*).
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -795,7 +801,7 @@ f = fn params ->
   mse.(preds, speed)
 end
 
-gradients = Nx.Defn.grad(fn p -> f.(p) end).(params)
+gradients = Nx.Defn.grad(f).(params)
 ```
 
 ```elixir
@@ -845,6 +851,17 @@ f = fn time, speed, pms ->
 end
 
 apply_step = fn params ->
+  {loss, gradients} = Nx.Defn.value_and_grad(fn p -> f.(time, speed, p) end).(params)
+
+  params = Nx.subtract(params, Nx.multiply(lr, gradients))
+  {loss, params}
+end
+
+apply_step.(params)
+```
+
+```elixir
+apply_step1 = fn params ->
   preds = quadratic.(time, params)
   loss = mse.(preds, speed)
   grad_func = Nx.Defn.grad(fn p -> f.(time, speed, p) end)
@@ -853,7 +870,14 @@ apply_step = fn params ->
   {loss, params}
 end
 
-apply_step.(params)
+apply_step2 = fn params ->
+  # preds = quadratic.(time, params)
+  # loss = mse.(preds, speed)
+  grad_func = Nx.Defn.value_and_grad(fn p -> f.(time, speed, p) end)
+  {loss, gradients} = grad_func.(params)
+  params = Nx.subtract(params, Nx.multiply(lr, gradients))
+  {loss, params}
+end
 ```
 
 #### Step 6: Repeat process
@@ -862,6 +886,13 @@ Now we iterate. By looping and performing many improvements, we hope to reach a 
 
 ```elixir
 # for i in range(10): apply_step(params)
+
+# for i <- 0..9, reduce: params do
+#   params ->
+#     {loss, new_params} = apply_step.(params)
+#     IO.inspect(loss, label: "loss #{i}")
+#     new_params
+# end
 
 params =
   Enum.reduce(0..9, params, fn i, params ->
@@ -1403,7 +1434,95 @@ end)
 
 Looking good! We're already about at the same accuracy as our "pixel similarity" approach, and we've created a general-purpose foundation we can build on. Our next step will be to create an object that will handle the SGD step for us. ~~In PyTorch, it's called an optimizer.~~
 
+## Creating an Optimizer
+
+We will see that `Axon` provides several Optimizers for us, but to demonstrate their purpose we'll build one from scratch.
+
+```elixir
+# linear_model = nn.Linear(28*28,1)
+# `linear_model = Nx.tensor()
+```
+
+Now we add parameters to train to the model.
+
+```elixir
+{params, _key} = Nx.Random.normal(key, shape: {784, 1})
+# params.shape
+# {weights, bias} = params
+# [weights.shape, bias.shape]
+:ok
+```
+
+```elixir
+# def train_epoch(model):
+#     for xb,yb in dl:
+#         calc_grad(xb, yb, model)
+#         opt.step()
+#         opt.zero_grad()
+train_epoch = fn model, dl ->
+  Enum.reduce(dl, model, fn {xb, yb}, model ->
+    :todo
+  end)
+end
+```
+
+```elixir
+# def train_model(model, epochs):
+#     for i in range(epochs):
+#         train_epoch(model)
+#         print(validate_epoch(model), end=' ')
+
+train_model = fn model, epochs ->
+  for _ <- 1..epochs, reduce: model do
+    model ->
+      newModel = train_epoch.(model)
+      validate_epoch.(newModel)
+      newModel
+  end
+end
+```
+
+##### Use Prebuilt optimizer to do the same thing
+
+```elixir
+# Python
+# linear_model = nn.Linear(28*28,1)
+# opt = SGD(linear_model.parameters(), lr)
+# train_model(linear_model, 20)
+
+# TODO
+# lr = 1.0
+# {inputs, targets} = hd(dl)
+
+# f = fn params, images, answers ->
+#   {weights, bias} = params
+#   preds = linear1.(images, weights, bias)
+#   mnist_loss.(preds, answers)
+# end
+
+# {params, _} = Nx.Random.normal(key, shape: {784,1})
+# # {bias, _} = Nx.Random.uniform(key, shape: {1})
+# {init_fn, update_fn} = Axon.Optimizers.sgd(lr)
+
+# # params = {weights, bias}
+# optimizer_state = init_fn.(params)
+# {loss, gradient} = Nx.Defn.value_and_grad(params, f)
+# {scaled_updates, new_optimizer_state} = update_fn.(gradient, optimizer_state, params)
+```
+
+##### Use Prebuilt learner to do the same thing
+
 ## Further Elixir Reading
 
+* Explorer and Dataframes - https://hexdocs.pm/explorer/exploring_explorer.html
 * NxImage examples - https://hexdocs.pm/nx_image/examples.html
 * Nx and MNIST - https://github.com/elixir-nx/nx/blob/main/exla/examples/mnist.exs
+* Axon and MNIST - https://hexdocs.pm/axon/mnist.html
+* Introducing Axon -
+
+## Todos
+
+* Move static diagrams to VegaLite
+* Move http to Req library
+* Create the w/ Python versions and remove Python code here
+* Change the Enum.reduce loops to for-loops for readability

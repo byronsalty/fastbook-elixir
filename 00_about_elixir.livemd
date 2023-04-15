@@ -36,6 +36,7 @@ Where possible this book should skew toward readability. Specifically there are 
 ## Additional Learning Opportunities
 
 * [José introduces Nx](https://www.youtube.com/watch?v=fPKMmJpAGWc)
+* Nx Homepage - https://github.com/elixir-nx
 
 ## Author
 
