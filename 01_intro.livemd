@@ -5,8 +5,18 @@ Mix.install([
   {:jason, "~> 1.4"},
   {:kino, "~> 0.8.0", override: true},
   {:httpoison, "~> 1.8"},
-  {:poison, "~> 5.0"}
+  {:nx, "~> 0.5.3"},
+  {:nx_image, "~> 0.1.1"},
+  {:axon, "~> 0.5.1"},
+  {:explorer, "~> 0.5.6"},
+  {:kino_explorer, "~> 0.1.2"},
+  {:exla, "~> 0.4"},
+  {:fastbook_elixir, path: "lib/fastbook_elixir"},
+  {:poison, "~> 5.0"},
+  {:bumblebee, "~> 0.3.0"}
 ])
+
+alias FastbookElixir.URLs
 ```
 
 ## Your Deep Learning Journey
@@ -255,11 +265,41 @@ Have any of the companies that allow running Jupyter with GPUs added support for
 
 ## Running Your First Livebook
 
-**TODO:**
+```elixir
+# Python
+# from fastai.vision.all import *
+# path = untar_data(URLs.PETS)/'images'
 
-This section might not be possible right now, as it's intended to show how easily a classifier can be built with some higher level libraries that might not exist in Elixir right now.
+# def is_cat(x): return x[0].isupper()
+# dls = ImageDataLoaders.from_name_func(
+#     path, get_image_files(path), valid_pct=0.2, seed=42,
+#     label_func=is_cat, item_tfms=Resize(224))
 
-<!-- livebook:{"break_markdown":true} -->
+# learn = vision_learner(dls, resnet34, metrics=error_rate)
+# learn.fine_tune(1)
+
+# --------
+
+# images = FastbookElixir.untar_data(URLs.pets())
+
+# is_cat = fn x -> x == String.capitalize(x) end
+# dls = 
+```
+
+```elixir
+require Explorer.DataFrame, as: DF
+
+series = Explorer.Series.from_list([1, 0, 3, -3, 2, -1, 3, 5, -4, 2, 1, 1, -1])
+keep = Explorer.Series.transform(series, fn x -> x > 0 end)
+Explorer.Series.mask(series, keep)
+```
+
+```elixir
+{:ok, resnet} = Bumblebee.load_model({:hf, "microsoft/resnet-50"})
+{:ok, featurizer} = Bumblebee.load_featurizer({:hf, "microsoft/resnet-50"})
+
+:ok
+```
 
 Original actually encourages running a separate book so it could be arbitrarily complicated as the point is simply to run a Livebook which allows building a model and then uploading an image to test against that classifier.
 
