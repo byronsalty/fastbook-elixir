@@ -47,11 +47,6 @@ In addition to these three Turing Award winners, there are many other researcher
 
 There is a lesson here for all of us! On your deep learning journey you will face many obstacles, both technical, and (even more difficult) posed by people around you who don't believe you'll be successful. There's one guaranteed way to fail, and that's to stop trying. We've seen that the only consistent trait amongst every fast.ai student that's gone on to be a world-class practitioner is that they are all very tenacious.
 
-```elixir
-mat = Nx.tensor([[1, 2], [3, 4]], names: [:y, :x])
-mat[x: -1]
-```
-
 ## 3s and 7s Classifier
 
 For this initial tutorial we are just going to try to create a model that can classify any image as a 3 or a 7. So let's download a sample of MNIST that contains images of just these digits:

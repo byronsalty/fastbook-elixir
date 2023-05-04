@@ -5,3 +5,7 @@
 * [Chapter 0: About Fastbook for Elixir](00_about_elixir.livemd)
 * [Chapter 1: Intro](01_intro.livemd)
 * [Chapter 4: MNIST Basics](04_mnist_basics.livemd)
+
+## Bonus
+
+* [Playground: Try things out](bonus_playground.livemd)
