@@ -1,0 +1,30 @@
+# Bonus: Playground
+
+```elixir
+Mix.install([
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.8.0", override: true},
+  {:kino_vega_lite, "~> 0.1.8"},
+  {:image, "~> 0.28.1"},
+  {:nx, "~> 0.5.3"},
+  {:nx_image, "~> 0.1.1"},
+  {:bumblebee, "~> 0.1"},
+  {:explorer, "~> 0.5.6"},
+  {:kino_explorer, "~> 0.1.2"},
+  {:exla, "~> 0.4"},
+  {:fastbook_elixir, path: "lib/fastbook_elixir"},
+  {:httpoison, "~> 1.8"},
+  {:poison, "~> 5.0"},
+  {:axon, "~> 0.5.1"}
+])
+
+# Nx.Defn.default_options(compiler: EXLA)
+
+alias FastbookElixir.URLs
+```
+
+## Try thing out here
+
+```elixir
+Nx.tensor([[1, 2, 3], [4, 5, 6]]) |> Nx.shape()
+```
