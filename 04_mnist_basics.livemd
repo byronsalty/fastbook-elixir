@@ -1,3 +1,5 @@
+<!-- livebook:{"file_entries":[{"name":"chapter2_bouncy.svg","type":"attachment"},{"name":"chapter2_div.svg","type":"attachment"},{"name":"chapter2_perfect.svg","type":"attachment"},{"name":"chapter2_small.svg","type":"attachment"},{"name":"grad_illustration.svg","type":"attachment"},{"name":"graph_fx2.png","type":"attachment"},{"name":"graph_fx2_point.png","type":"attachment"},{"name":"graph_speed_plot.png","type":"attachment"},{"name":"matmul2.svg","type":"attachment"},{"name":"sigmoid.png","type":"attachment"}]} -->
+
 # Chapter 4: MNIST Basics
 
 ```elixir
@@ -559,24 +561,24 @@ f = fn x -> x ** 2 end
 
 Here is a graph of that function:
 
-![](images/graph_fx2.png)
+![](files/graph_fx2.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
 The sequence of steps we described earlier starts by picking some random value for a parameter, and calculating the value of the loss:
-![](images/graph_fx2_point.png)
+![](files/graph_fx2_point.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
 Now we look to see what would happen if we increased or decreased our parameter by a little bit—the *adjustment*. This is simply the slope at a particular point:
 
-![](images/grad_illustration.svg)
+![](files/grad_illustration.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
 We can change our weight by a little in the direction of the slope, calculate our loss and adjustment again, and repeat this a few times. Eventually, we will get to the lowest point on our curve:
 
-![](images/chapter2_perfect.svg)
+![](files/chapter2_perfect.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -661,19 +663,19 @@ If you pick a learning rate that's too low, it can mean having to do a lot of st
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/chapter2_small.svg)
+![](files/chapter2_small.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
 But picking a learning rate that's too high is even worse—it can actually result in the loss getting *worse*, as we see in <<descent_div>>!
 
-![](images/chapter2_div.svg)
+![](files/chapter2_div.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
 If the learning rate is too high, it may also "bounce" around, rather than actually diverging; <> shows how this has the result of taking many steps to train successfully.
 
-![](images/chapter2_bouncy.svg)
+![](files/chapter2_bouncy.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -711,7 +713,7 @@ end
 speed = get_speed.(time)
 ```
 
-![](images/graph_speed_plot.png)
+![](files/graph_speed_plot.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -1014,7 +1016,7 @@ In this case, there's an extremely convenient mathematical operation that calcul
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/matmul2.svg)
+![](files/matmul2.svg)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -1132,7 +1134,7 @@ sigmoid = fn x -> Nx.divide(1, Nx.add(1, Nx.exp(-x))) end
 
 Nx defines an accelerated version for us, so we don’t really need our own. This is an important function in deep learning, since we often want to ensure values are between 0 and 1. This is what it looks like:
 
-![](images/sigmoid.png)
+![](files/sigmoid.png)
 
 As you can see, it takes any input value, positive or negative, and smooshes it onto an output value between 0 and 1. It's also a smooth curve that only goes up, which makes it easier for SGD to find meaningful gradients.
 

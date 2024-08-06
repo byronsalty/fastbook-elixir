@@ -1,3 +1,5 @@
+<!-- livebook:{"file_entries":[{"name":"att_00000.png","type":"attachment"},{"name":"chapter2_layer3.PNG","type":"attachment"},{"name":"chapter2_layer4and5.PNG","type":"attachment"},{"name":"chapter7_neuron.png","type":"attachment"},{"name":"driver.png","type":"attachment"},{"name":"timeseries3.png","type":"attachment"},{"name":"timeseries2.png","type":"attachment"},{"name":"layer1.png","type":"attachment"},{"name":"timeseries1.png","type":"attachment"},{"name":"att_00056.png","type":"attachment"},{"name":"att_00055.png","type":"attachment"},{"name":"layer2.png","type":"attachment"},{"name":"att_00014.png","type":"attachment"},{"name":"att_00013.png","type":"attachment"},{"name":"att_00012.png","type":"attachment"}]} -->
+
 # Fastbook Elixir - Chapter 1
 
 ```elixir
@@ -75,7 +77,11 @@ McCulloch and Pitts realized that a simplified model of a real neuron could be r
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/chapter7_neuron.png)
+![](files/chapter7_neuron.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -518,7 +524,7 @@ Even when your model has not fully memorized all your data, earlier on in traini
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00000.png)
+![](files/att_00000.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -538,7 +544,7 @@ In 2013 a PhD student, Matt Zeiler, and his supervisor, Rob Fergus, published th
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/layer1.png)
+![](files/layer1.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -546,7 +552,7 @@ This picture requires some explanation. For each layer, the image part with the 
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/layer2.png)
+![](files/layer2.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -556,7 +562,7 @@ For layer 2, there are nine examples of weight reconstructions for each of the f
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/chapter2_layer3.PNG)
+![](files/chapter2_layer3.PNG)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -564,7 +570,7 @@ As you can see by looking at the righthand side of this picture, the features ar
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/chapter2_layer4and5.PNG)
+![](files/chapter2_layer4and5.PNG)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -580,7 +586,7 @@ For instance, a sound can be converted to a spectrogram, which is a chart that s
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00012.png)
+![](files/att_00012.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -588,7 +594,7 @@ A time series can easily be converted into an image by simply plotting the time 
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00013.png)
+![](files/att_00013.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -596,7 +602,7 @@ Another interesting fast.ai student project example comes from Gleb Esman. He wa
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00014.png)
+![](files/att_00014.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -604,7 +610,7 @@ Another example comes from the paper ["Malware Classification with Deep Convolut
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00055.png)
+![](files/att_00055.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -612,7 +618,7 @@ The authors then show "pictures" generated through this process of malware in di
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/att_00056.png)
+![](files/att_00056.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -734,7 +740,7 @@ Suppose you want to split the time series data in <<timeseries1>> into training 
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/timeseries1.png)
+![](files/timeseries1.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -742,7 +748,7 @@ A random subset is a poor choice (too easy to fill in the gaps, and not indicati
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/timeseries2.png)
+![](files/timeseries2.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -750,7 +756,7 @@ Instead, use the earlier data as your training set (and the later data for the v
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/timeseries3.png)
+![](files/timeseries3.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
@@ -764,7 +770,7 @@ In the Kaggle [distracted driver competition](https://www.kaggle.com/c/state-far
 
 <!-- livebook:{"break_markdown":true} -->
 
-![](images/driver.png)
+![](files/driver.png)
 
 <!-- livebook:{"break_markdown":true} -->
 
