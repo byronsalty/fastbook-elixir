@@ -14,7 +14,7 @@ Mix.install([
   {:explorer, "~> 0.5.6"},
   {:kino_explorer, "~> 0.1.2"},
   {:exla, "~> 0.4"},
-  {:fastbook_elixir, path: "lib/fastbook_elixir"},
+  {:fastbook_elixir, path: "."},
   {:httpoison, "~> 1.8"},
   {:poison, "~> 5.0"},
   {:axon, "~> 0.5.1"}

@@ -1,0 +1,45 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/format-elixir.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "stop_reason=end_turn",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd $CLAUDE_PROJECT_DIR && just test"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/changelog-reminder.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(mix test:*)",
+      "Bash(MIX_ENV=test mix test:*)",
+      "Bash(mix compile)",
+      "Bash(mix format)",
+      "Bash(cd book && mix test:*)",
+      "Bash(cd book && mix compile:*)",
+      "Bash(cd book && mix format)"
+    ]
+  }
+}

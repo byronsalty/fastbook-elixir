@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook: format, compile, test
+# Only runs checks when Elixir files are staged.
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(ex|exs)$' || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+echo "==> Pre-commit: Elixir files changed"
+
+# Find app directory
+if [ -d "book" ]; then
+    APP_DIR="book"
+else
+    APP_DIR="."
+fi
+
+echo "  > Formatting..."
+cd "$APP_DIR"
+mix format
+cd - > /dev/null
+
+# Re-add any formatted files
+echo "$STAGED_FILES" | xargs git add
+
+echo "  > Compiling (warnings-as-errors)..."
+cd "$APP_DIR"
+mix compile --warnings-as-errors
+cd - > /dev/null
+
+echo "  > Testing..."
+cd "$APP_DIR"
+mix test --max-failures=5
+cd - > /dev/null
+
+echo "==> Pre-commit: All checks passed"

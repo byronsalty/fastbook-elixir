@@ -4,13 +4,7 @@ defmodule FastbookElixir do
   """
 
   @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> FastbookElixir.hello()
-      :world
-
+  Downloads and extracts a tar file from a URL.
   """
   def untar_data(url) do
 
@@ -34,7 +28,7 @@ defmodule FastbookElixir do
   def show_image(tensor) do
     tensor =
       if Nx.rank(tensor) == 2 do
-        Nx.reshape(tensor, Tuple.append(Nx.shape(tensor), 1))
+        Nx.reshape(tensor, Tuple.insert_at(Nx.shape(tensor), tuple_size(Nx.shape(tensor)), 1))
       else
         tensor
       end

@@ -8,29 +8,44 @@ This version of the book is intended to be an introduction to AI using the same 
 
 As part of that transition we will also move from Jupyter Notebooks to Elixir's Livebooks.
 
-# Expectations
+## Expectations
 
-This is intended to follow the original work as closely as possible but I expect that there will be many areas where Elixir does not have the same capabilities as the very mature Python+ML/AI stacks. 
+This is intended to follow the original work as closely as possible but I expect that there will be many areas where Elixir does not have the same capabilities as the very mature Python+ML/AI stacks.
 
 Therefore there will be gaps in the content and the reader is encouraged to also look at the original work.
 
-# Getting Started
+## Getting Started
 
-## Install necessary Elixir dependencies
+### Prerequisites
 
+- [Elixir](https://elixir-lang.org/install.html)
+- [Livebook](https://github.com/livebook-dev/livebook) — install with `mix escript.install hex livebook`
 
-### Install Livebook
+### Setup
 
-https://github.com/livebook-dev/livebook
-
-# Up and Running
-
-## Run the whole book
 ```
-livebook server start.livemd
+just setup
 ```
 
-## Run a specific chapter
+This installs dependencies, creates your `.env` file, and configures git hooks.
+
+Run `just doctor` to verify your environment is ready.
+
+## Up and Running
+
+### Run the whole book
 ```
-livebook server <xx_chapter.livemd>
+just livebook-start
 ```
+
+### Run a specific chapter
+```
+just livebook-ch1
+```
+
+### Run any livebook file directly
+```
+just livebook book/01_intro.livemd
+```
+
+Run `just` to see all available commands.

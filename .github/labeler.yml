@@ -1,0 +1,8 @@
+feature:
+  - head-branch: ['^feature', '^minor']
+bug:
+  - head-branch: ['^bug', '^fix']
+major:
+  - head-branch: ['^major']
+other:
+  - head-branch: ['^other']

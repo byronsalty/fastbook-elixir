@@ -1,0 +1,53 @@
+name: Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ELIXIR_VERSION: ${{ vars.ELIXIR_VERSION }}
+  OTP_VERSION: ${{ vars.OTP_VERSION }}
+  MIX_ENV: test
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Compile & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: book
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache@v3
+        id: cache-deps
+        with:
+          path: book/deps
+          key: ${{ runner.os }}-mix-deps-${{ hashFiles('book/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-deps-
+
+      - uses: actions/cache@v3
+        id: cache-build
+        with:
+          path: book/_build
+          key: ${{ runner.os }}-mix-build-${{ hashFiles('book/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-build-
+            ${{ runner.os }}-mix-
+
+      - run: |
+          mix deps.clean --all
+          mix clean
+        if: github.run_attempt != '1'
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test

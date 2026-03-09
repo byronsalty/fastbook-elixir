@@ -4,3 +4,31 @@ deps
 .elixir_ls
 .DS_Store
 .standards
+
+# Environment
+.env
+.env.old
+.env.prod
+.env.prod*
+.envrc
+
+# PR review files
+.pr-context.md
+pr-review-*.md
+
+# Task files
+tasks.json
+tasks/
+
+# TaskRoyale (local only)
+.royale.json
+.mcp.json
+
+# Crash dumps
+erl_crash.dump
+
+# Test artifacts
+book/test.tar
+
+# Symlinks (created by standards install)
+bin/release
