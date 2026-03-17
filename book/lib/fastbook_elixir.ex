@@ -7,7 +7,6 @@ defmodule FastbookElixir do
   Downloads and extracts a tar file from a URL.
   """
   def untar_data(url) do
-
     # download the url
     data = HTTPoison.get!(url)
 
@@ -21,7 +20,7 @@ defmodule FastbookElixir do
     with {:ok, files} <- :erl_tar.extract({:binary, binary}, [:memory, :compressed]) do
       files
       |> Enum.map(fn {filename, content} -> {to_string(filename), content} end)
-      |> Map.new
+      |> Map.new()
     end
   end
 
