@@ -8,10 +8,10 @@ defmodule FastbookElixir do
   """
   def untar_data(url) do
     # download the url
-    data = HTTPoison.get!(url)
+    %{body: body} = Req.get!(url)
 
     # extract the tar file
-    extract_tar_from_binary(data.body)
+    extract_tar_from_binary(body)
   end
 
   def extract_tar_from_binary(binary) do

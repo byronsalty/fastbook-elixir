@@ -5,19 +5,18 @@
 ```elixir
 Mix.install([
   {:jason, "~> 1.4"},
-  {:kino, "~> 0.8.0", override: true},
-  {:kino_vega_lite, "~> 0.1.8"},
-  {:image, "~> 0.28.1"},
-  {:nx, "~> 0.5.3"},
-  {:nx_image, "~> 0.1.1"},
-  {:bumblebee, "~> 0.1"},
-  {:explorer, "~> 0.5.6"},
-  {:kino_explorer, "~> 0.1.2"},
-  {:exla, "~> 0.4"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1.13"},
+  {:image, "~> 0.63"},
+  {:nx, "~> 0.11"},
+  {:nx_image, "~> 0.1.2"},
+  {:bumblebee, "~> 0.6"},
+  {:explorer, "~> 0.11"},
+  {:kino_explorer, "~> 0.1.25"},
+  {:exla, "~> 0.11"},
   {:fastbook_elixir, path: "."},
-  {:httpoison, "~> 1.8"},
-  {:poison, "~> 5.0"},
-  {:axon, "~> 0.5.1"}
+  {:req, "~> 0.5"},
+  {:axon, "~> 0.8"}
 ])
 
 # Nx.Defn.default_options(compiler: EXLA)
@@ -1499,7 +1498,7 @@ end
 
 # {params, _} = Nx.Random.normal(key, shape: {784,1})
 # # {bias, _} = Nx.Random.uniform(key, shape: {1})
-# {init_fn, update_fn} = Axon.Optimizers.sgd(lr)
+# {init_fn, update_fn} = Polaris.Optimizers.sgd(learning_rate: lr)
 
 # # params = {weights, bias}
 # optimizer_state = init_fn.(params)

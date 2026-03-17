@@ -27,14 +27,14 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-deps
         with:
           path: book/deps
           key: ${{ runner.os }}-mix-deps-${{ hashFiles('book/mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-deps-
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-build
         with:
           path: book/_build

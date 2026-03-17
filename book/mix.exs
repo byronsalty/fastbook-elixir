@@ -5,7 +5,7 @@ defmodule FastbookElixir.MixProject do
     [
       app: :fastbook_elixir,
       version: "0.1.0",
-      elixir: "~> 1.14",
+      elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -21,9 +21,9 @@ defmodule FastbookElixir.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:httpoison, "~> 2.3"},
-      {:nx, "~> 0.9", optional: true},
-      {:kino, "~> 0.14", optional: true}
+      {:req, "~> 0.5"},
+      {:nx, "~> 0.11", optional: true},
+      {:kino, "~> 0.19", optional: true}
     ]
   end
 end
