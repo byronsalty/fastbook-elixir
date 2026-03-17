@@ -20,21 +20,21 @@ jobs:
       run:
         working-directory: book
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: cache-deps
         with:
           path: book/deps
           key: ${{ runner.os }}-mix-deps-${{ hashFiles('book/mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-deps-
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: cache-build
         with:
           path: book/_build
