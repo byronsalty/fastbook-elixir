@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
 
 env:
-  ELIXIR_VERSION: ${{ vars.ELIXIR_VERSION }}
-  OTP_VERSION: ${{ vars.OTP_VERSION }}
+  ELIXIR_VERSION: "1.17.3"
+  OTP_VERSION: "27.2"
   MIX_ENV: test
 
 permissions:
