@@ -21,7 +21,6 @@ tasks.json
 tasks/
 
 # TaskRoyale (local only)
-.royale.json
 .mcp.json
 
 # Crash dumps
