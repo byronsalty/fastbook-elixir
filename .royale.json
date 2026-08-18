@@ -1,3 +1,3 @@
 {
-  "test_command": "cd book && mix test"
+  "test_command": "cd book && mix deps.get && mix test"
 }
