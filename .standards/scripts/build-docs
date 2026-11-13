@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# build-docs — render a design-docs directory to styled HTML + PDF.
+#
+#   *.md  → pandoc (gfm → html5, built-in code highlighting) → styled HTML
+#           (docs.css inlined) → Chrome headless → PDF
+#   *.svg → copied to the output dir (the HTML references them), plus a
+#           standalone full-size <name>-diagram.pdf via rsvg-convert
+#
+# Incremental: an output is skipped when it is newer than its source AND the
+# stylesheet (a CSS edit must re-render everything).
+#
+# Configuration is by environment — set in the project's justfile
+# (`export DOCS_SRC := "webapp/docs/design"`) or `.env`:
+#   DOCS_SRC   authoring dir, relative to the project root   (default docs/design)
+#   DOCS_OUT   output dir, relative to the project root       (default publish — gitignore it)
+#   DOCS_CSS   stylesheet (default $DOCS_SRC/_assets/docs.css, falling back to
+#              .standards/templates/docs/docs.css so a project renders before it
+#              has copied the stylesheet in)
+#   CHROME     path to a Chrome/Chromium binary (auto-detected on macOS/Linux)
+#
+# Prereqs: pandoc (required), Chrome (required), librsvg (optional — no diagram
+# PDFs without it). macOS: brew install pandoc librsvg
+set -euo pipefail
+
+resolve_script_dir() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+cd "$PROJECT_ROOT"
+
+SRC="${DOCS_SRC:-docs/design}"
+OUT="${DOCS_OUT:-publish}"
+CSS="${DOCS_CSS:-$SRC/_assets/docs.css}"
+[ -f "$CSS" ] || CSS="$SCRIPT_DIR/../templates/docs/docs.css"
+
+find_chrome() {
+    if [ -n "${CHROME:-}" ] && [ -x "$CHROME" ]; then echo "$CHROME"; return; fi
+    for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+             google-chrome google-chrome-stable chromium chromium-browser; do
+        if [[ "$c" == /* ]]; then [ -x "$c" ] && { echo "$c"; return; }
+        else command -v "$c" >/dev/null && { command -v "$c"; return; }; fi
+    done
+    return 1
+}
+
+[ -d "$SRC" ] || { echo "no docs dir at $SRC (set DOCS_SRC)"; exit 1; }
+command -v pandoc >/dev/null || { echo "pandoc not found — brew install pandoc"; exit 1; }
+CHROME_BIN="$(find_chrome)" || { echo "Chrome/Chromium not found — set CHROME=/path/to/chrome"; exit 1; }
+mkdir -p "$OUT"
+
+# 1. Diagrams: copy the raw SVG + a standalone full-size PDF.
+if command -v rsvg-convert >/dev/null; then
+  for svg in "$SRC"/*.svg; do
+    [ -e "$svg" ] || continue
+    name="$(basename "${svg%.svg}")"; pdf="$OUT/${name}-diagram.pdf"
+    cp "$svg" "$OUT/"
+    if [ -f "$pdf" ] && [ "$pdf" -nt "$svg" ]; then echo "↻ $pdf (up to date)"; else
+      echo "→ $svg → $pdf"; rsvg-convert -f pdf -o "$pdf" "$svg"
+    fi
+  done
+else
+  echo "⚠ rsvg-convert not found — skipping diagram PDFs (brew install librsvg)"
+fi
+
+# 2. Markdown → styled HTML → PDF.
+style="$(cat "$CSS")"
+for md in "$SRC"/*.md; do
+  [ -e "$md" ] || continue
+  name="$(basename "${md%.md}")"
+  html="$OUT/${name}.html"; pdf="$OUT/${name}.pdf"
+  if [ -f "$pdf" ] && [ "$pdf" -nt "$md" ] && [ "$pdf" -nt "$CSS" ]; then
+    echo "↻ $pdf (up to date)"; continue
+  fi
+  echo "→ $md → $pdf"
+  {
+    echo "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>${name}</title>"
+    echo "<style>${style}</style>"
+    echo "<style>@page { margin: 1.6cm; } body { margin: 0; }</style>"
+    echo "</head><body>"
+    pandoc -f gfm -t html5 "$md"
+    echo "</body></html>"
+  } > "$html"
+  "$CHROME_BIN" --headless --disable-gpu --no-pdf-header-footer \
+    --print-to-pdf="$pdf" "file://$PROJECT_ROOT/$html" 2>/dev/null \
+    || echo "  ⚠ Chrome PDF failed for $name"
+done
+
+echo "✓ published to $OUT/  (from $SRC/, css $CSS)"

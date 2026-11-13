@@ -1,0 +1,8 @@
+# GitGuardian secret-scanning config.
+# .standards/workflows/ holds CI workflow templates synced verbatim from the
+# engineering standards repo. Their `POSTGRES_PASSWORD: postgres` is the
+# credential for an ephemeral CI service container, not a real secret.
+version: 2
+secret:
+  ignored_paths:
+    - ".standards/workflows/**"

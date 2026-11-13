@@ -1,5 +1,5 @@
 Compile the webapp with warnings-as-errors. Fix any warnings.
 
 ```
-cd book && mix compile --warnings-as-errors
+cd webapp && mix compile --warnings-as-errors
 ```

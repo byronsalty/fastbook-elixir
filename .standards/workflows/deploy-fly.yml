@@ -1,0 +1,161 @@
+name: Deploy to Fly.io
+
+# Production deploys on a v* tag (cut by `just release`). Push-to-main deploys
+# belong to a staging copy of this file pointed at the staging app.
+#
+# Lines marked `# PROJECT:` are the per-project knobs. Repo settings used:
+#   secrets.FLY_API_TOKEN          flyctl deploy token
+#   secrets.ROYALE_URL             Royale base URL for the failure alert (optional)
+#   vars.HEALTHCHECK_URL           e.g. https://<app>.fly.dev/healthcheck
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    env:
+      MIX_ENV: test
+      # PROJECT: match config/test.exs.
+      TEST_DB_PORT: "5432"
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test  # PROJECT: match config/test.exs
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # PROJECT: pinned to match webapp/Dockerfile (pr-webapp.yml checks it;
+      # a ${{ vars.* }} pin could drift from what ships without any diff).
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3.4"
+          elixir-version: "1.18.4"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            webapp/deps
+            webapp/_build
+          key: ${{ runner.os }}-mix-${{ hashFiles('webapp/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test
+
+  deploy:
+    name: Deploy to Fly
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency: deploy-group
+    steps:
+      - uses: actions/checkout@v7
+
+      # A bare `git tag` still triggers this deploy but ships code WITHOUT the
+      # version bump `just release` makes, so the in-app version freezes while
+      # newer code deploys (lacta v0.16.3–v0.16.5 shipped that way). Fail fast
+      # when the tag doesn't match the version file the app compiles in.
+      # PROJECT: VERSION_FILE / VERSION_REGEX: whatever carries the shipped
+      # version (webapp/mix.exs `version: "..."`, pubspec `version: ...`, etc.).
+      - name: Verify tag matches shipped version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION_FILE: webapp/mix.exs
+          VERSION_REGEX: 'version: "([^"]*)"'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          SHIPPED="$(grep -oE "$VERSION_REGEX" "$VERSION_FILE" | head -1 | sed -E "s/$VERSION_REGEX/\\1/")"
+          echo "Tag version: $TAG"
+          echo "$VERSION_FILE version: $SHIPPED"
+          if [ "$TAG" != "$SHIPPED" ]; then
+            echo "::error::Tag v$TAG does not match $VERSION_FILE version $SHIPPED."
+            echo "::error::Releases must be cut with 'just release <version>' (never a bare 'git tag'), which bumps the version files. See RELEASING.md."
+            exit 1
+          fi
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # PROJECT: fly config / Dockerfile paths.
+      - run: flyctl deploy --remote-only --config webapp/fly.prod.toml --dockerfile webapp/Dockerfile
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      # A single successful curl is not proof of life: an app whose Chrome
+      # cannot start serves /healthcheck for a few seconds before its
+      # supervisor gives up and the BEAM exits, and the platform restarts it
+      # straight back — so a one-shot probe can land in the window and call a
+      # crash loop "healthy" (lacta v0.42.x bookworm images). Fly's own deploy
+      # health check is that one-shot window too. Require a sustained stretch
+      # of consecutive OK probes.
+      - name: Sustained health check
+        if: vars.HEALTHCHECK_URL != ''
+        env:
+          HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL }}
+          # PROJECT: body substring a healthy response contains.
+          HEALTHCHECK_EXPECT: '"status":"OK"'
+        run: |
+          required=6      # consecutive OK probes, 5s apart (~30s of stability)
+          deadline=$((SECONDS + 180))
+          ok=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if curl -sf -m 10 "$HEALTHCHECK_URL" | grep -qF "$HEALTHCHECK_EXPECT"; then
+              ok=$((ok + 1))
+              echo "OK ($ok/$required)"
+              if [ "$ok" -ge "$required" ]; then
+                echo "Healthy: stable for $required consecutive probes"
+                exit 0
+              fi
+            else
+              [ "$ok" -gt 0 ] && echo "Probe failed after $ok OK probe(s) — resetting"
+              ok=0
+            fi
+            sleep 5
+          done
+          echo "::error::Never stayed healthy for $required consecutive probes within 180s"
+          exit 1
+
+  # Report a failed prod deploy (test failure, build failure, migration
+  # failure, Fly refusing machines whose health checks never went green, or a
+  # crash loop caught above) the moment it happens rather than when someone
+  # notices (lacta deploy.yml). `failure()` here is true when ANY ancestor job
+  # failed, so a red `test` job alerts too. GitHub also emails the tagger.
+  notify-failure:
+    name: Notify on failure
+    needs: deploy
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report deploy failure to Royale
+        env:
+          ROYALE_URL: ${{ secrets.ROYALE_URL }}
+          ALERT_TYPE: ${{ github.event.repository.name }}_prod_deploy_failure
+          HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL }}
+        run: |
+          if [ -z "$ROYALE_URL" ]; then
+            echo "::warning::ROYALE_URL secret not set — no alert sent"
+            exit 0
+          fi
+          details="${GITHUB_REPOSITORY} PROD deploy failed for ${GITHUB_REF_NAME} - previous release should still be serving; verify ${HEALTHCHECK_URL:-the app}. Logs: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n --arg type "$ALERT_TYPE" --arg details "$details" \
+              '{message_type: "report_system_alert", args: {type: $type, details: $details}}' \
+            | curl -sf -X POST "$ROYALE_URL/api/mcp" -H "Content-Type: application/json" -d @- \
+            || echo "::warning::could not send failure notification"

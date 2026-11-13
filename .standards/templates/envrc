@@ -1,0 +1,2 @@
+# Committed. Holds no secrets: it loads the gitignored .env into the shell.
+dotenv

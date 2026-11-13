@@ -1,0 +1,73 @@
+name: pr-docker
+
+# PR gate for the runtime image. The image is otherwise built only by the
+# tag-triggered deploy, so a broken base image / apt package / runtime user is
+# first discovered in production. This builds only the RUNTIME stage of
+# webapp/Dockerfile (OS packages + runtime user, no Elixir compile, ~1-2 min).
+#
+# Why: lacta's bullseye->bookworm base-image move (c7206cc9) merged on a green
+# PR; bookworm's Chromium refuses to start without a writable HOME, which took
+# both staging and prod down. Anything that changes the base image, the apt
+# packages, or the runtime user goes through here first.
+#
+# Requires webapp/Dockerfile to name its runtime stage (PROJECT: RUNTIME_STAGE):
+#
+#     FROM ${RUNNER_IMAGE} AS runtime-base
+#     ...apt-get install, useradd, ENV HOME...
+#     FROM runtime-base
+#     COPY --from=builder ... /app
+#
+# Apps that bundle Chrome (ChromicPDF etc.) should also end the runtime-base
+# stage with a smoke RUN as the runtime user, so the stage build itself fails
+# when Chrome can't launch:
+#
+#     USER nobody
+#     RUN chromium --headless --disable-breakpad --no-sandbox --disable-gpu \
+#           --disable-dev-shm-usage --dump-dom about:blank >/dev/null
+on:
+  pull_request:
+    paths:
+      - "webapp/Dockerfile"
+      - ".github/workflows/pr-docker.yml"
+
+concurrency:
+  group: pr-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # PROJECT: name of the runtime stage in webapp/Dockerfile.
+  RUNTIME_STAGE: runtime-base
+
+jobs:
+  runtime-base:
+    name: runtime image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # `--target` stops before the release is copied in, so no BEAM toolchain
+      # or dependency fetch is needed. `--load` so the next step can run it.
+      - name: Build the runtime stage
+        run: |
+          docker buildx build --load --target "$RUNTIME_STAGE" -t runtime-base \
+            -f webapp/Dockerfile webapp
+
+      # OPTIONAL — only for apps that bundle Chrome/Chromium (ChromicPDF,
+      # headless screenshots). Belt and braces: exercise the built image the
+      # way the app does at runtime (same user and HOME the release gets), so a
+      # regression in the Dockerfile's own smoke RUN cannot silently turn the
+      # gate off (lacta bookworm incident above). Delete for apps without Chrome.
+      # PROJECT: runtime user and Chrome binary name.
+      - name: "OPTIONAL: Chromium renders a page as the runtime user"
+        run: |
+          docker run --rm --user nobody runtime-base \
+            sh -c 'echo "user=$(id -un) HOME=$HOME"; chromium --version; \
+                   chromium --headless --disable-breakpad --no-sandbox --disable-gpu \
+                     --disable-dev-shm-usage --dump-dom about:blank' \
+            | tee /tmp/dump.txt
+          grep -q '<html' /tmp/dump.txt

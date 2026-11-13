@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generate platform-pure App Store / Play Store release-notes docs for a SINGLE
+# platform, covering everything since the version that platform's users last had.
+#
+# Usage: bin/release-notes-platform <ios|android> <previous-store-version> [new-version]
+#
+#   <previous-store-version>  The version currently LIVE on that platform's store —
+#                             what users are upgrading FROM. The two stores are
+#                             usually on different versions, which is why this is
+#                             per-platform and passed explicitly. Do NOT use the
+#                             last git tag: we tag far more often than we submit
+#                             builds, so that produces near-empty notes.
+#
+#   [new-version]             The version being submitted. Defaults to the VERSION
+#                             file (stripped of any -rcN suffix). Pass it explicitly
+#                             to generate store docs BEFORE `just release` bumps
+#                             the version files, so the docs ride along in the same
+#                             release commit.
+#
+# Output: <release_notes.dir>/<version>-<platform>.md — the store-submission
+# source of truth, in a fixed format:
+#   - Promotional Text / Short Description (with the store's char limit)
+#   - What's New (copy/paste block for the store console)
+#   - Version Details
+#   - Detailed Feature Breakdown (internal reference)
+#   - Technical Notes
+#
+# An existing doc is never overwritten by a failed/garbled generation: the first
+# line is validated against the expected header before anything is written.
+# Fields with a store length limit (Promotional Text / Short Description, Play's
+# What's New) are measured exactly and, when over, sent back to be shortened
+# (up to three tries) before the doc is written. If one is still over, the doc is
+# written anyway with a warning, for a hand edit.
+#
+# Config: release-config.json > release_notes
+#   dir, app_name, app_description, audience, banned_terms, extra_rules,
+#   unannounced_terms — as for release-notes (unannounced terms go into the
+#   prompt, and any hit in the written doc is reported; `release-notes` is the
+#   gate that aborts a release on it); plus
+#   closing_line                 last line of the What's New block
+#   platforms.<ios|android>.paths  git pathspecs that define this platform's
+#                                  diff window, e.g. for Flutter:
+#                                    ["mobile/", ":(exclude)mobile/android"]
+#                                  for native: ["ios/", "backend/"]
+#
+# Status messages go to stderr; the generated doc goes to stdout.
+
+resolve_script_dir() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+CONFIG_FILE="$PROJECT_ROOT/release-config.json"
+
+# shellcheck source=lib/version-files.sh
+source "$SCRIPT_DIR/lib/version-files.sh"
+
+PLATFORM="${1:-}"
+PREV_VERSION="${2:-}"
+NEW_VERSION="${3:-}"
+
+if [ -z "$PLATFORM" ] || [ "$PLATFORM" = "--help" ] || [ "$PLATFORM" = "-h" ]; then
+    echo "Usage: bin/release-notes-platform <ios|android> <previous-store-version> [new-version]" >&2
+    echo "" >&2
+    echo "  <previous-store-version>  version currently live on that store (e.g. 0.27.4)" >&2
+    echo "  [new-version]             version being submitted (defaults to VERSION file)" >&2
+    exit 0
+fi
+
+cfg() { # cfg <jq-path> <default>
+    if [ -f "$CONFIG_FILE" ]; then
+        jq -r "$1 // empty" "$CONFIG_FILE" 2>/dev/null | { read -r v || true; echo "${v:-$2}"; }
+    else
+        echo "$2"
+    fi
+}
+NOTES_DIR=$(cfg '.release_notes.dir' 'releases')
+APP_NAME=$(cfg '.release_notes.app_name' "$(basename "$PROJECT_ROOT")")
+APP_DESC=$(cfg '.release_notes.app_description' '')
+AUDIENCE=$(cfg '.release_notes.audience' 'end users')
+BANNED_TERMS=$(cfg '.release_notes.banned_terms' '')
+CLOSING_LINE=$(cfg '.release_notes.closing_line' "Thank you for using ${APP_NAME}!")
+EXTRA_RULES=""
+PLATFORM_PATHS=""
+TERMS=$(unannounced_terms)
+UNANNOUNCED_RULE=$(unannounced_rule "$TERMS")
+if [ -f "$CONFIG_FILE" ]; then
+    EXTRA_RULES=$(jq -r '(.release_notes.extra_rules // []) | map("- " + .) | join("\n")' "$CONFIG_FILE" 2>/dev/null || true)
+    PLATFORM_PATHS=$(jq -r --arg p "$PLATFORM" '(.release_notes.platforms[$p].paths // []) | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+fi
+
+case "$PLATFORM" in
+    ios)
+        PLATFORM_LABEL="App Store (iOS)"
+        STORE_LABEL="App Store"
+        CONSOLE="App Store Connect"
+        OTHER_PLATFORM="Android"
+        PROMO_FIELD="Promotional Text (170 character limit)"
+        PROMO_LIMIT=170
+        WHATSNEW_LIMIT=0          # App Store "What's New" has no tight limit
+        DEFAULT_PATHS=("ios/") ;;
+    android)
+        PLATFORM_LABEL="Play Store (Android)"
+        STORE_LABEL="Play Store"
+        CONSOLE="Play Console"
+        OTHER_PLATFORM="iOS"
+        PROMO_FIELD="Short Description (80 character limit)"
+        PROMO_LIMIT=80
+        WHATSNEW_LIMIT=500        # Play Store "What's New" hard limit
+        DEFAULT_PATHS=("android/") ;;
+    *)
+        echo "Error: platform must be 'ios' or 'android'." >&2
+        exit 1 ;;
+esac
+
+if [ -n "$PLATFORM_PATHS" ]; then
+    PATHS=()
+    while IFS= read -r p; do [ -n "$p" ] && PATHS+=("$p"); done <<< "$PLATFORM_PATHS"
+else
+    PATHS=("${DEFAULT_PATHS[@]}")
+    echo "  > No release_notes.platforms.${PLATFORM}.paths configured; using ${PATHS[*]}" >&2
+fi
+
+if [ -z "$PREV_VERSION" ]; then
+    echo "Error: provide the version currently live on the ${PLATFORM_LABEL} (e.g. 0.27.4)." >&2
+    exit 1
+fi
+if ! validate_semver "$PREV_VERSION"; then
+    echo "Error: previous version must be semver (e.g. 1.2.3 or 1.2.3.1)." >&2
+    exit 1
+fi
+
+if [ -z "$NEW_VERSION" ]; then
+    NEW_VERSION=$(sed 's/-rc[0-9]*$//' "$PROJECT_ROOT/VERSION")
+    echo "  > No version given; using VERSION file: ${NEW_VERSION}" >&2
+fi
+if ! validate_semver "$NEW_VERSION"; then
+    echo "Error: new version must be semver (e.g. 1.2.3 or 1.2.3.1)." >&2
+    exit 1
+fi
+
+VERSION="$NEW_VERSION"
+PREV_TAG="v${PREV_VERSION}"
+
+if ! git -C "$PROJECT_ROOT" rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+    echo "Error: tag ${PREV_TAG} not found (is that version really shipped?)." >&2
+    exit 1
+fi
+
+PREV_DATE=$(git -C "$PROJECT_ROOT" log -1 --format=%ad --date=format:'%B %-d, %Y' "$PREV_TAG")
+if git -C "$PROJECT_ROOT" rev-parse "v${VERSION}" >/dev/null 2>&1; then
+    THIS_DATE=$(git -C "$PROJECT_ROOT" log -1 --format=%ad --date=format:'%B %-d, %Y' "v${VERSION}")
+else
+    THIS_DATE=$(date '+%B %-d, %Y')
+fi
+
+echo "  > ${PLATFORM_LABEL}: ${PREV_TAG}..HEAD  (paths: ${PATHS[*]})" >&2
+GIT_LOG=$(git -C "$PROJECT_ROOT" log --pretty='%h %s%n%b' "${PREV_TAG}..HEAD" -- "${PATHS[@]}")
+DIFF_STAT=$(git -C "$PROJECT_ROOT" diff --stat "${PREV_TAG}..HEAD" -- "${PATHS[@]}")
+echo "  > Found $(git -C "$PROJECT_ROOT" log --oneline "${PREV_TAG}..HEAD" -- "${PATHS[@]}" | grep -c . || true) relevant commits" >&2
+[ -z "$GIT_LOG" ] && echo "  > Warning: no commits touch ${PATHS[*]} since ${PREV_TAG}." >&2
+
+if [ "$WHATSNEW_LIMIT" -gt 0 ]; then
+    # The model can't count characters, so give it a shape that fits instead of
+    # a total: the fixed first and last lines leave BULLET_BUDGET for bullets,
+    # and five bullets with headroom (it runs long) gives the per-bullet length.
+    WHATSNEW_LEAD="What's New in Version ${VERSION}"
+    BULLET_BUDGET=$(( WHATSNEW_LIMIT - ${#WHATSNEW_LEAD} - ${#CLOSING_LINE} - 4 ))
+    WHATSNEW_RULE="The text inside the What's New code block MUST be ${WHATSNEW_LIMIT} characters or fewer (${STORE_LABEL} hard limit). Its first and last lines leave about ${BULLET_BUDGET} characters for the bullets, so write at most five bullets, each one short line under $(( BULLET_BUDGET / 5 - 10 )) characters."
+else
+    WHATSNEW_RULE="Keep the What's New block concise (a one-line lead plus short bullets)."
+fi
+
+DESC_CLAUSE=""
+[ -n "$APP_DESC" ] && DESC_CLAUSE=" (${APP_DESC})"
+BANNED_CLAUSE="frameworks, libraries, or technologies (e.g. Phoenix, LiveView, Ecto, Flutter, Dart, Riverpod, Swift, Kotlin, Postgres, S3${BANNED_TERMS:+, $BANNED_TERMS})"
+
+PROMPT="You are writing the ${PLATFORM_LABEL} release-notes document for ${APP_NAME}${DESC_CLAUSE}, for users upgrading from ${PREV_VERSION} to ${VERSION}.
+
+CRITICAL RULES:
+${UNANNOUNCED_RULE:+$UNANNOUNCED_RULE
+}- This is ${PLATFORM_LABEL} copy. NEVER mention ${OTHER_PLATFORM} or any other platform in a store-facing section (Promotional/Short Description, What's New). Never write phrases like \"parity with ${OTHER_PLATFORM}\", \"to match ${OTHER_PLATFORM}\", or \"now on ${OTHER_PLATFORM} too\". The internal sections (Detailed Feature Breakdown, Technical Notes) MAY name ${OTHER_PLATFORM} where it is genuinely useful to the person submitting the build — e.g. noting that a feature in this range is ${OTHER_PLATFORM}-only and therefore absent from the store copy above.
+- Store-facing sections are for ${AUDIENCE}, not engineers. Write each bullet as something the user would notice in day-to-day use, phrased as the outcome rather than the cause.
+- Do NOT mention ${BANNED_CLAUSE}, file paths, module or class names, error class names, migrations, test suites, CI, or deploy plumbing in any store-facing section.
+- Omit any commit that is purely internal — refactors, test additions, dependency bumps, schema upgrades, CI changes, tooling. It is fine to produce few bullets if the release is mostly internal.
+${EXTRA_RULES:+$EXTRA_RULES
+}- ${PROMO_FIELD%% (*} MUST be ${PROMO_LIMIT} characters or fewer.
+- ${WHATSNEW_RULE}
+- Output ONLY the markdown document below. No preamble, no commentary, no extra code fences beyond the two shown.
+
+Produce EXACTLY this structure (fill in the bracketed parts; keep the headings verbatim):
+
+# ${APP_NAME} v${VERSION} - ${STORE_LABEL} Release Notes
+
+_Platform-pure — do not mention ${OTHER_PLATFORM} in any store-facing section._
+
+## ${PROMO_FIELD}
+
+\`\`\`
+[one or two sentences, <= ${PROMO_LIMIT} chars]
+\`\`\`
+
+---
+
+## What's New (copy/paste for ${CONSOLE})
+
+\`\`\`
+What's New in Version ${VERSION}
+
+- [bullet]
+- [bullet]
+...
+
+${CLOSING_LINE}
+\`\`\`
+
+---
+
+## Version Details
+- **Version**: ${VERSION}
+- **Previous Release**: ${PREV_VERSION} (${PREV_DATE})
+- **This Release**: ${THIS_DATE}
+
+---
+
+## Detailed Feature Breakdown (Internal Reference)
+
+[One '### Title' subsection per notable user-facing feature, each with a one-line summary and a short bullet list of specifics. End with a '### Bug Fixes & Improvements' subsection.]
+
+---
+
+## Technical Notes
+[Short bullets: notable implementation details, new dependencies, migrations, or fixes worth recording for the team. This is the only section that may reference code-level specifics.]
+
+Base everything on these commits and file changes since ${PREV_TAG}:
+
+Commits:
+${GIT_LOG}
+
+File changes:
+${DIFF_STAT}"
+
+DOC_FILE=$(mktemp)
+# `--tools ""` disables all tools for the nested run. Without it the model writes
+# the file itself and returns a status sentence instead of the document — which
+# then fails the header check below. CLAUDE_RELEASE_NOTES_GENERATING makes the
+# project's Stop hooks skip this run so their feedback can't be captured AS the
+# document. Capture stdout only — never merge stderr (2>&1) into the document.
+echo "  > Calling Claude for ${STORE_LABEL} notes..." >&2
+CLAUDE_RELEASE_NOTES_GENERATING=1 \
+    claude -p "$PROMPT" --model sonnet --tools "" > "$DOC_FILE" 2>/dev/null || true
+DOC=$(cat "$DOC_FILE")
+rm -f "$DOC_FILE"
+
+# Validate: the model must have returned OUR document, not hook feedback or an error.
+EXPECTED_HEADER="# ${APP_NAME} v${VERSION} - ${STORE_LABEL} Release Notes"
+if [ "$(printf '%s' "$DOC" | head -n1)" != "$EXPECTED_HEADER" ]; then
+    echo "  > ERROR: generation did not return the expected document — existing file left untouched." >&2
+    echo "  > Expected first line: ${EXPECTED_HEADER}" >&2
+    echo "  > Got first line:      $(printf '%s' "$DOC" | head -n1)" >&2
+    exit 1
+fi
+echo "  > Document generated." >&2
+
+# --- Fit the length-limited store fields ---
+#
+# Asking for "<= N characters" in the prompt isn't enough: the model can't count,
+# and overshoots (v0.55.1's Play notes by 121; lacta v0.64.0's twice, by 59 and
+# 114), which only surfaced when the release gate or the store refused it. So
+# measure each field exactly as the store does (characters, not bytes; the
+# first fenced block under its heading, as the store pack reads it) and, while
+# it's over, hand the text back with its real count to be shortened.
+
+# store_block <len|fixed|body|set> <doc> <heading> [new-body-file]
+#   len    the block's length, as the store counts it
+#   body   the part to shorten: for a block of 3+ lines (What's New), the lines
+#          between its first (the version lead) and last (the closing line),
+#          which stay as they are; otherwise the whole block
+#   fixed  len minus the body's length
+#   set    replace the body; refuses (exit 2) an empty reply or one with a fence
+#          left inside it, which isn't the shortened text
+STORE_BLOCK_PY='
+import re, sys
+mode, path, heading = sys.argv[1:4]
+lines = open(path, encoding="utf-8").read().split("\n")
+start = level = None
+fences, in_fence = [], False
+for i, line in enumerate(lines):
+    if line.startswith("```"):
+        if start is not None:
+            fences.append(i)
+        in_fence = not in_fence
+        if len(fences) == 2:
+            break
+        continue
+    m = None if in_fence else re.match(r"^(#+)\s+(.*)$", line)
+    if not m:
+        continue
+    if start is None:
+        if m.group(2).strip().lower().startswith(heading.lower()):
+            start, level = i, len(m.group(1))
+    elif len(m.group(1)) <= level:
+        break
+if len(fences) < 2:
+    sys.exit("no fenced block under \"%s\" in %s" % (heading, path))
+a, b = fences
+while b > a + 1 and not lines[b - 1]:
+    b -= 1
+lo, hi = a + 1, b
+if b - a - 1 >= 3:
+    lo, hi = a + 2, b - 1
+    while lo < hi and not lines[lo].strip():
+        lo += 1
+    while hi > lo and not lines[hi - 1].strip():
+        hi -= 1
+whole = "\n".join(lines[a + 1:b])
+body = "\n".join(lines[lo:hi])
+if mode == "len":
+    print(len(whole))
+elif mode == "fixed":
+    print(len(whole) - len(body))
+elif mode == "body":
+    sys.stdout.write(body)
+elif mode == "set":
+    new = open(sys.argv[4], encoding="utf-8").read().strip().split("\n")
+    if len(new) >= 2 and new[0].startswith("```") and new[-1].startswith("```"):
+        new = new[1:-1]
+    if not "".join(new).strip() or any(l.startswith("```") for l in new):
+        sys.exit(2)
+    lines[lo:hi] = new
+    open(path, "w", encoding="utf-8").write("\n".join(lines))
+'
+store_block() { python3 -c "$STORE_BLOCK_PY" "$@"; }
+
+# fit_block <heading> <limit> — up to three shortening passes, aiming 10% under
+# the limit so a pass that lands close still fits. Returns 1 if still over.
+fit_block() {
+    local heading="$1" limit="$2" n fixed attempt prompt
+    for attempt in 1 2 3; do
+        n=$(store_block len "$WORK_FILE" "$heading") || return 1
+        [ "$n" -le "$limit" ] && break
+        fixed=$(store_block fixed "$WORK_FILE" "$heading") || return 1
+        echo "  > ${heading}: ${n} characters, over the ${limit} limit — shortening (try ${attempt} of 3)..." >&2
+        prompt="Shorten this ${STORE_LABEL} release-notes text to $(( limit * 9 / 10 - fixed )) characters or fewer, counting spaces and line breaks. It is $(( n - fixed )) characters now. Keep the same format and line style. Tighten the wording first; drop the least important line only if tightening alone can't get there. Add nothing new. Output ONLY the shortened text: no code fence, no count, no commentary.
+
+$(store_block body "$WORK_FILE" "$heading")"
+        CLAUDE_RELEASE_NOTES_GENERATING=1 \
+            claude -p "$prompt" --model sonnet --tools "" > "$SHORT_FILE" 2>/dev/null || true
+        store_block set "$WORK_FILE" "$heading" "$SHORT_FILE" \
+            || echo "  > That reply wasn't the shortened text; ignoring it." >&2
+    done
+    n=$(store_block len "$WORK_FILE" "$heading") || return 1
+    echo "  > ${heading}: ${n} characters (limit ${limit})." >&2
+    if [ "$n" -gt "$limit" ]; then
+        echo "  > WARNING: ${heading} is still over ${limit} characters — trim it before submitting." >&2
+        return 1
+    fi
+}
+
+WORK_FILE=$(mktemp)
+SHORT_FILE=$(mktemp)
+trap 'rm -f "$WORK_FILE" "$SHORT_FILE"' EXIT
+printf '%s\n' "$DOC" > "$WORK_FILE"
+fit_block "${PROMO_FIELD%% (*}" "$PROMO_LIMIT" || true
+if [ "$WHATSNEW_LIMIT" -gt 0 ]; then
+    fit_block "What's New" "$WHATSNEW_LIMIT" || true
+fi
+
+mkdir -p "$PROJECT_ROOT/$NOTES_DIR"
+OUT_FILE="$PROJECT_ROOT/$NOTES_DIR/${VERSION}-${PLATFORM}.md"
+cp "$WORK_FILE" "$OUT_FILE"
+echo "  > Wrote $NOTES_DIR/${VERSION}-${PLATFORM}.md" >&2
+
+if ! scan_unannounced "$TERMS" "$NOTES_DIR/${VERSION}-${PLATFORM}.md" "$OUT_FILE"; then
+    echo "  > WARNING: the doc mentions unannounced work — edit it; \`just release\` refuses it as-is." >&2
+fi
+
+echo "  > Review the doc before submitting: char limits, platform purity, and nothing sensitive from commit messages." >&2
+
+cat "$OUT_FILE"

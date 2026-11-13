@@ -1,0 +1,35 @@
+name: Security
+
+# Dependency and static security audits. Weekly + on demand; a failing audit
+# opens the conversation rather than blocking a PR (deps.audit in particular
+# flags transitive advisories nobody can fix that day). Keep the schedule: a
+# dispatch-only audit (lacta's copy) runs only when someone remembers to.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v7
+      # PROJECT: pinned to match webapp/Dockerfile (pr-webapp.yml checks it).
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3.4"
+          elixir-version: "1.18.4"
+      - run: mix deps.get
+      # `success() || failure()`: one advisory must not hide the other audits.
+      - run: mix hex.audit
+        if: success() || failure()
+      - run: mix deps.audit
+        if: success() || failure()
+      - run: mix sobelow --config --exit
+        if: success() || failure()
