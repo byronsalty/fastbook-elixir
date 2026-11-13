@@ -1,0 +1,48 @@
+version: 2
+# Weekly, grouped minor+patch so one PR per ecosystem lands on Monday instead of
+# a dozen. Keep one block per package tree the project actually SHIPS — a
+# package.json no build installs only produces phantom update PRs.
+updates:
+  - package-ecosystem: "mix"
+    directory: "/webapp"
+    schedule: { interval: "weekly", day: "monday" }
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/webapp/assets"
+    schedule: { interval: "weekly", day: "monday" }
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/website"
+    schedule: { interval: "weekly", day: "monday" }
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Uncomment for the components the project has.
+  # - package-ecosystem: "pub"
+  #   directory: "/mobile"
+  #   schedule: { interval: "weekly", day: "monday" }
+  #   groups: { minor-and-patch: { update-types: ["minor", "patch"] } }
+  # - package-ecosystem: "gradle"
+  #   directory: "/android"
+  #   schedule: { interval: "weekly", day: "monday" }
+  # - package-ecosystem: "swift"
+  #   directory: "/ios"
+  #   schedule: { interval: "weekly", day: "monday" }
+
+  - package-ecosystem: "docker"
+    directory: "/webapp"
+    schedule: { interval: "weekly", day: "monday" }
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]

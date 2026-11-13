@@ -1,0 +1,50 @@
+# -----------------------------------------------------------------------------
+# NEVER add `.standards/` or `bin/<script>` symlinks here — they are COMMITTED.
+# lacta and best_year both ignored `.standards/` and `bin/release` after
+# committing them: every file upstream added later was silently ignored on
+# sync, and a fresh clone of best_year had no bin/release.
+# -----------------------------------------------------------------------------
+
+# Environment — .env.example and .envrc are committed; everything else is local
+# (catches .env, .env.prod, .env.local, .env.stage, foo.env).
+.env
+.env.*
+*.env
+!.env.example
+
+# PR review files
+.pr-context.md
+pr-review-*.md
+
+# Task files (anchored — an un-anchored `tasks/` hid Elixir's lib/mix/tasks/ in lacta)
+/tasks.json
+/tasks/
+
+# Claude Code local state: personal settings, runtime locks
+# (scheduled_tasks.lock), in-session worktrees, hook logs (stop-test.sh keeps
+# failing runs here)
+.claude/settings.local.json
+.claude/*.lock
+.claude/worktrees/
+.claude/logs/
+
+# Rendered design docs (just docs-pdf) — reproducible from docs/design/
+publish/
+
+# Mobile / Firebase credentials — harmless in projects without them.
+# Commit stand-ins instead: google-services.json.template, Secrets.example.*
+# Keep release keystores OUTSIDE the working tree; one ignore pattern is all
+# that stands between an in-repo keystore and a `git add -A`.
+*.jks
+*.keystore
+key.properties
+keystore.properties
+secrets.properties
+serviceAccountKey.json
+GoogleService-Info.plist
+google-services.json
+Secrets.swift
+firebase-debug*.log
+firestore-debug.log
+ui-debug.log
+.firebase/

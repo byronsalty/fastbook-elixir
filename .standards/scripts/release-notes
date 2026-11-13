@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generate the dev/web release notes for a version and update changelog.json —
+# plus the two changelog chores that must agree with it: validating the
+# changelog files, and drafting the in-app What's New.
+#
+# Usage:
+#   bin/release-notes <version> [--mobile] [--ios-from <ver>] [--android-from <ver>]
+#   bin/release-notes --validate                      # `just test`
+#   bin/release-notes --draft-inapp <version> [--dry-run]   # prerelease rc1
+#
+# `bin/release` runs the first form at its step 3 — after the tests, BEFORE it
+# bumps any version file — so a failure here aborts the release with nothing
+# mutated. It forwards --mobile / --ios-from / --android-from. Run it directly
+# to draft notes for a version without tagging.
+#
+# Re-runs: the changelog.json entry is upserted in place, but an existing
+# <dir>/<version>.md (and any store doc) is KEPT as the edited truth — delete a
+# file to regenerate it. Every gate below aborts after generation, and the fix is
+# to edit the copy and re-run; overwriting the hand-fix on that re-run would
+# make the gate unpassable (best_year).
+#
+# Notes mode, in order:
+#   1. In-app changelog gate (release_notes.inapp_changelogs) — refuses if a
+#      compiled-in "What's New" file has no entry for this version. Downgrade to
+#      a warning with ALLOW_STALE_INAPP_CHANGELOG=1 (the `just release-notes`
+#      recipe sets it, since you need the notes to write those entries).
+#   2. --mobile: generate any missing <dir>/<version>-<platform>.md store doc for
+#      each configured platform (release-notes-platform), diffed from the version
+#      live on that store. Fatal on failure: the flag was asked for.
+#   3. Dev notes: keep <dir>/<version>.md, or have headless Claude write it from
+#      `git log <last-tag>..HEAD`.
+#   4. Validate the pending changelog.d/<branch>.json entries.
+#   5. Unannounced-terms gate over everything this release publishes.
+#   6. Upsert the release into changelog.json; delete the consumed entry files.
+#   7. Warn if a configured platform's store doc is still missing.
+#
+# Status messages go to stderr; ONLY the notes text goes to stdout, because
+# bin/release captures stdout as the release notes.
+#
+# Config: release-config.json > release_notes (all optional):
+#   app_name, app_description   who/what the notes are for
+#   audience                    e.g. "clinicians and staff" (default "end users")
+#   banned_terms                extra technology names never to mention
+#   extra_rules                 array of additional prompt rules (e.g. HIPAA)
+#   unannounced_terms           array of words that must never appear in any
+#                               release copy (see lib/version-files.sh)
+#   dir                         where the docs go (default "releases")
+#   platforms                   {ios: {...}, android: {...}} — which store docs exist
+#   inapp_changelogs            compiled-in What's New files (schema below)
+#   inapp_feature_defaults      object merged into every drafted feature card,
+#                               e.g. {"icon": "sparkles"} for fields the app
+#                               decodes as non-optional (default {})
+#   inapp_required_feature_fields  extra feature fields --validate requires as
+#                               non-empty strings (title, description always)
+#   inapp_trailing_change       last line of every drafted changes[] (default
+#                               "Bug fixes and stability improvements"; "" = none)
+#
+# In-app changelog schema (each inapp_changelogs file) — a FLAT ARRAY, newest first:
+#   [ { "version": "1.6.3", "date": "2026-09-08",
+#       "features": [ { "title": "...", "description": "...", "tag": "new|improved", ...app fields } ],
+#       "changes":  [ "one line", ... ] } ]
+# features/changes are optional. This is NOT the web changelog.json shape
+# ({unreleased, releases}) — see --validate for why the two must never cross.
+
+resolve_script_dir() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+CONFIG_FILE="$PROJECT_ROOT/release-config.json"
+
+# shellcheck source=lib/version-files.sh
+source "$SCRIPT_DIR/lib/version-files.sh"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: bin/release-notes <version> [--mobile] [--ios-from <ver>] [--android-from <ver>]
+       bin/release-notes --validate
+       bin/release-notes --draft-inapp <version> [--dry-run]
+
+Generate release notes and update changelog.json for a given version.
+Idempotent: safe to re-run; existing <dir>/<version>*.md docs are kept
+(delete one to regenerate it).
+
+  --mobile             also generate any missing store docs
+                       (<dir>/<version>-{ios,android}.md, configured platforms only)
+  --ios-from <ver>     version currently LIVE on the App Store (what users upgrade
+                       from); defaults to the newest existing -ios.md doc
+  --android-from <ver> same for the Play Store
+  --validate           check the in-app changelogs and changelog.d/ entries (just test)
+  --draft-inapp        draft <version>'s in-app What's New from changelog.d/
+                       (--dry-run prints it instead)
+EOF
+}
+
+parse_release_args "$@"
+MODE=notes
+DRY_RUN=false
+for arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+    case "$arg" in
+        --validate) MODE=validate ;;
+        --draft-inapp) MODE=draft ;;
+        --dry-run) DRY_RUN=true ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Error: unknown option '$arg'." >&2; usage; exit 1 ;;
+    esac
+done
+if [ "$MODE" != notes ] && [ ${#NOTES_ARGS[@]} -gt 0 ]; then
+    echo "Error: --mobile / --ios-from / --android-from only apply to notes mode." >&2
+    exit 1
+fi
+if [ "$DRY_RUN" = true ] && [ "$MODE" != draft ]; then
+    echo "Error: --dry-run only applies to --draft-inapp." >&2
+    exit 1
+fi
+if [ "$MODE" = validate ] && [ -n "$VERSION" ]; then
+    echo "Error: --validate takes no version." >&2
+    exit 1
+fi
+if [ "$MODE" != validate ]; then
+    [ -n "$VERSION" ] || { usage; exit 0; }
+    VERSION="${VERSION%%-rc*}"   # a prerelease VERSION file says 1.2.3-rc2; notes are for 1.2.3
+    if ! validate_semver "$VERSION"; then
+        echo "Error: Version must be semver (e.g. 1.2.3 or 1.2.3.1)" >&2
+        exit 1
+    fi
+fi
+[ "$MODE" = notes ] && validate_notes_flags
+
+# --- Config -----------------------------------------------------------------
+cfg() { # cfg <jq-path> <default>
+    if [ -f "$CONFIG_FILE" ]; then
+        jq -r "$1 // empty" "$CONFIG_FILE" 2>/dev/null | { read -r v || true; echo "${v:-$2}"; }
+    else
+        echo "$2"
+    fi
+}
+CHANGELOG_JSON=$(cfg '.changelog_json' '')
+CHANGELOG_DIR=$(cfg '.changelog_dir' '')
+NOTES_DIR=$(cfg '.release_notes.dir' 'releases')
+APP_NAME=$(cfg '.release_notes.app_name' "$(basename "$PROJECT_ROOT")")
+APP_DESC=$(cfg '.release_notes.app_description' '')
+AUDIENCE=$(cfg '.release_notes.audience' 'end users')
+BANNED_TERMS=$(cfg '.release_notes.banned_terms' '')
+EXTRA_RULES=""
+if [ -f "$CONFIG_FILE" ]; then
+    EXTRA_RULES=$(jq -r '(.release_notes.extra_rules // []) | map("- " + .) | join("\n")' "$CONFIG_FILE" 2>/dev/null || true)
+    HAS_PLATFORMS=$(configured_platforms 2>/dev/null || true)
+    INAPP_CHANGELOGS=$(jq -r '(.release_notes.inapp_changelogs // []) | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    INAPP_FEATURE_DEFAULTS=$(jq -c '.release_notes.inapp_feature_defaults // {}' "$CONFIG_FILE")
+    INAPP_REQUIRED_FIELDS=$(jq -c '["title", "description"] + (.release_notes.inapp_required_feature_fields // []) | unique' "$CONFIG_FILE")
+    INAPP_TRAILING_CHANGE=$(jq -r '.release_notes.inapp_trailing_change // "Bug fixes and stability improvements"' "$CONFIG_FILE")
+else
+    HAS_PLATFORMS=""
+    INAPP_CHANGELOGS=""
+    INAPP_FEATURE_DEFAULTS='{}'
+    INAPP_REQUIRED_FIELDS='["description","title"]'
+    INAPP_TRAILING_CHANGE="Bug fixes and stability improvements"
+fi
+NOTES_DIR_FULL="$PROJECT_ROOT/$NOTES_DIR"
+
+# --- Changelog checks (shared by --validate, --draft-inapp and notes mode) -----
+
+# changelog.d/*.json, one per line (none if changelog_dir isn't configured).
+entry_files() {
+    [ -n "$CHANGELOG_DIR" ] && [ -d "$PROJECT_ROOT/$CHANGELOG_DIR" ] || return 0
+    find "$PROJECT_ROOT/$CHANGELOG_DIR" -maxdepth 1 -name '*.json' | sort
+}
+
+# check_entry_files — every pending entry parses, has a known category and a
+# non-empty description. A malformed file must fail loudly rather than drop
+# someone's entry from the published changelog; the release used to check only
+# the object shape, so a typo'd category sailed through to /changelog.
+check_entry_files() { # [--quiet] suppresses the per-file "ok" lines
+    local f rel errors status=0 quiet="${1:-}"
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        rel="${f#"$PROJECT_ROOT/"}"
+        if ! errors=$(jq -r '
+            if type != "array" and type != "object" then
+              "must be an entry object or an array of them, got \(type)"
+            else
+              (if type == "array" then . else [.] end) | to_entries[] | .key as $i | .value
+              | if type != "object" then "entry \($i): must be an object, got \(type)"
+                elif ((.category // null) | IN("feature", "bug", "improvement") | not) then
+                  "entry \($i): category must be feature, bug or improvement (got \(.category | tojson))"
+                elif (.description | type) != "string" or (.description | test("^\\s*$")) then
+                  "entry \($i): description must be a non-empty string"
+                else empty end
+            end' "$f" 2>&1); then
+            errors="invalid JSON: $errors"
+        fi
+        if [ -n "$errors" ]; then
+            echo "FAIL $rel" >&2
+            printf '%s\n' "$errors" | sed 's/^/     /' >&2
+            status=1
+        elif [ "$quiet" != --quiet ]; then
+            echo "  ok  $rel" >&2
+        fi
+    done <<< "$(entry_files)"
+    return $status
+}
+
+# check_inapp_files — each release_notes.inapp_changelogs file is the flat
+# in-app array. Crossing it with the web changelog's {unreleased, releases}
+# shape is not hypothetical: an "unreleased" object was once prepended to
+# best_year's iOS array, Swift's Codable decode threw, and the What's New screen
+# was blank for two releases. Only a new build can fix a compiled-in file, so
+# this runs in `just test`, before anything reaches a store build.
+check_inapp_files() {
+    local rel path errors status=0
+    for rel in $INAPP_CHANGELOGS; do
+        path="$PROJECT_ROOT/$rel"
+        if [ ! -f "$path" ]; then
+            echo "FAIL $rel — configured in release_notes.inapp_changelogs but not found" >&2
+            status=1
+            continue
+        fi
+        if ! errors=$(jq -r --argjson req "$INAPP_REQUIRED_FIELDS" '
+            if type != "array" then
+              "root must be a flat array of version entries, got \(type) — {unreleased, releases} is the web changelog shape"
+            else
+              (to_entries[] | .key as $i | .value
+               | if type != "object" then "entry \($i): must be an object, got \(type)"
+                 elif has("unreleased") or has("releases") then
+                   "entry \($i): has an \"unreleased\"/\"releases\" key — that is the web changelog shape, not the in-app one"
+                 elif (.version | type) != "string" then "entry \($i): \"version\" must be a string"
+                 elif (.date | type) != "string" or (.date | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$") | not) then
+                   "entry \($i) (\(.version)): \"date\" must be a yyyy-MM-dd string"
+                 elif has("features") and (.features | type) != "array" then "entry \($i) (\(.version)): \"features\" must be an array"
+                 elif has("changes") and (.changes | type) != "array" then "entry \($i) (\(.version)): \"changes\" must be an array"
+                 else
+                   .version as $v
+                   | ((.features // []) | to_entries[] | .key as $j | .value
+                      | if type != "object" then "entry \($i) (\($v)): feature \($j) must be an object"
+                        else ($req - [$req[] as $k | select((.[$k] | type) == "string" and .[$k] != "") | $k]) as $missing
+                             | select($missing | length > 0)
+                             | "entry \($i) (\($v)): feature \($j) needs non-empty string \($missing | join(", "))"
+                        end),
+                     ((.changes // []) | to_entries[] | select((.value | type) != "string")
+                      | "entry \($i) (\($v)): change \(.key) must be a string")
+                 end),
+              ([.[] | objects | .version | strings] | group_by(.) | map(select(length > 1) | .[0])[]
+               | "version \(.) appears more than once")
+            end' "$path" 2>&1); then
+            errors="invalid JSON: $errors"
+        fi
+        if [ -n "$errors" ]; then
+            echo "FAIL $rel" >&2
+            printf '%s\n' "$errors" | sed 's/^/     /' >&2
+            status=1
+        else
+            echo "  ok  $rel ($(jq length "$path") entries)" >&2
+        fi
+    done
+    return $status
+}
+
+# check_web_changelog — the reverse crossing: changelog.json must stay the
+# {unreleased?, releases} object the /changelog page and the upsert below expect.
+check_web_changelog() {
+    local path="$PROJECT_ROOT/$CHANGELOG_JSON"
+    [ -n "$CHANGELOG_JSON" ] && [ -f "$path" ] || return 0
+    if jq -e 'type == "object" and (.releases | type) == "array" and ((.unreleased // []) | type) == "array"' \
+        "$path" >/dev/null 2>&1; then
+        echo "  ok  $CHANGELOG_JSON" >&2
+    else
+        echo "FAIL $CHANGELOG_JSON — must be an object with a \"releases\" array (and optional \"unreleased\" array)" >&2
+        return 1
+    fi
+}
+
+# inapp_has_version <file> — true if the flat array already has an entry for $VERSION.
+inapp_has_version() {
+    jq -e --arg v "$VERSION" 'type == "array" and (map(select(.version == $v)) | length > 0)' "$1" >/dev/null 2>&1
+}
+
+# inapp_platform_of <path> — ios | android | "" by path segment, so iOS-only and
+# Android-only lines reach only the matching file.
+inapp_platform_of() {
+    local lower
+    lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    if [[ "$lower" =~ (^|[^a-z])ios([^a-z]|$) ]]; then echo ios
+    elif [[ "$lower" =~ (^|[^a-z])android([^a-z]|$) ]]; then echo android
+    fi
+}
+
+# --- --validate ------------------------------------------------------------------
+if [ "$MODE" = validate ]; then
+    STATUS=0
+    check_inapp_files || STATUS=1
+    check_entry_files || STATUS=1
+    check_web_changelog || STATUS=1
+    if [ "$STATUS" -ne 0 ]; then
+        echo "" >&2
+        echo "Changelog validation failed. In-app changelogs are a flat array of" >&2
+        echo "{version, date, features[]?, changes[]?}; changelog.d entries are" >&2
+        echo "{category: feature|bug|improvement, description}." >&2
+        exit 1
+    fi
+    echo "Changelogs valid." >&2
+    exit 0
+fi
+
+# --- --draft-inapp -----------------------------------------------------------------
+# Drafts <version>'s entry in every inapp_changelogs file from the pending
+# changelog.d/ entries (plus any legacy `unreleased` in changelog.json).
+#
+# Why here and why then: the in-app files are compiled into the binary, so the
+# entry has to exist before the tester build that gets promoted to the store —
+# `bin/prerelease` runs this on rc1, not at `just release` (which only gates on
+# it). Why changelog.d and not the git log: those entries are human-written and
+# only what someone chose to announce appears; commit messages describe
+# everything, including unlaunched work. No Claude call — nothing is invented.
+#
+#   feature / improvement  -> features[] card ({title, description, tag: new|improved}
+#                             + inapp_feature_defaults placeholders)
+#   bug (or anything else) -> changes[] line, then inapp_trailing_change
+#   "iOS: ..." / "Android: ..." -> only the file whose path names that platform,
+#                             prefix stripped; never a platform-neutral file
+#
+# Idempotent: a file that already has the version is kept. Nothing else is
+# modified — notes mode drains changelog.d/ at tag time. Prints each drafted
+# file on stdout (prerelease commits them); --dry-run prints the entries instead.
+if [ "$MODE" = draft ]; then
+    if [ -z "$INAPP_CHANGELOGS" ]; then
+        echo "  > No release_notes.inapp_changelogs configured — nothing to draft." >&2
+        exit 0
+    fi
+    check_entry_files --quiet || { echo "Error: fix the entries above, then re-run." >&2; exit 1; }
+    ENTRY_LIST=$(entry_files)
+    ITEMS="[]"
+    if [ -n "$ENTRY_LIST" ]; then
+        # shellcheck disable=SC2086
+        ITEMS=$(jq -s 'map(if type == "array" then .[] else . end)' $ENTRY_LIST)
+    fi
+    if [ -n "$CHANGELOG_JSON" ] && [ -f "$PROJECT_ROOT/$CHANGELOG_JSON" ]; then
+        ITEMS=$(jq --argjson items "$ITEMS" '$items + (.unreleased // [])' "$PROJECT_ROOT/$CHANGELOG_JSON")
+    fi
+    if [ "$(jq length <<< "$ITEMS")" -eq 0 ]; then
+        echo "  ⚠️  No pending changelog entries — the $VERSION What's New will only carry" >&2
+        echo "      \"${INAPP_TRAILING_CHANGE}\". Add changelog.d/ entries and re-run if it has more to say." >&2
+    fi
+    TERMS=$(unannounced_terms)
+    TODAY=$(date +%Y-%m-%d)
+    DRAFTED=""
+    STATUS=0
+    for REL in $INAPP_CHANGELOGS; do
+        FILE="$PROJECT_ROOT/$REL"
+        if [ ! -f "$FILE" ]; then
+            echo "  ⚠️  $REL not found — skipping." >&2
+            continue
+        fi
+        if ! jq -e 'type == "array"' "$FILE" >/dev/null 2>&1; then
+            echo "  ✗ $REL is not a flat JSON array — not touching it (run: just validate-changelogs)." >&2
+            STATUS=1
+            continue
+        fi
+        if inapp_has_version "$FILE"; then
+            echo "  > $REL already has $VERSION — keeping it." >&2
+            continue
+        fi
+        ENTRY=$(jq -n --argjson items "$ITEMS" --arg v "$VERSION" --arg date "$TODAY" \
+                --arg platform "$(inapp_platform_of "$REL")" \
+                --argjson defaults "$INAPP_FEATURE_DEFAULTS" --arg trailing "$INAPP_TRAILING_CHANGE" '
+            def prefix_of: if test("^(ios|android):"; "i") then (capture("^(?<p>ios|android):"; "i").p | ascii_downcase) else "" end;
+            def upcase_first: (.[0:1] | ascii_upcase) + .[1:];
+            # Title: text before the first colon or dash, capped at six words.
+            def title_of:
+              (split(":")[0] | split(" — ")[0] | split(" - ")[0]) as $t
+              | ($t | split(" ")) as $w
+              | (if ($w | length) > 6 then ($w[0:6] | join(" ")) else $t end) | upcase_first;
+            def body_of: if test(":\\s") then (split(":")[1:] | join(":") | ltrimstr(" ") | upcase_first) else . end;
+            [ $items[]
+              | (.description | prefix_of) as $p
+              | select($p == "" or ($platform != "" and $p == $platform))
+              | .description |= sub("^(ios|android):\\s*"; ""; "i") ] as $scoped
+            | { version: $v, date: $date,
+                features: [ $scoped[] | select(.category == "feature" or .category == "improvement")
+                            | $defaults + { title: (.description | title_of),
+                                            description: (.description | body_of),
+                                            tag: (if .category == "feature" then "new" else "improved" end) } ],
+                changes: ([ $scoped[] | select(.category != "feature" and .category != "improvement") | .description ]
+                          + (if $trailing == "" then [] else [$trailing] end)) }
+            | if (.features | length) == 0 then del(.features) else . end
+            | if (.changes | length) == 0 then del(.changes) else . end')
+
+        ENTRY_TMP=$(mktemp)
+        printf '%s\n' "$ENTRY" > "$ENTRY_TMP"
+        # changelog.d is human-written, but humans describe unlaunched work too;
+        # notes mode will abort the release on this, so say it now.
+        scan_unannounced "$TERMS" "$REL draft" "$ENTRY_TMP" || \
+            echo "    (just release will refuse this until the entry is reworded)" >&2
+        rm -f "$ENTRY_TMP"
+
+        if [ "$DRY_RUN" = true ]; then
+            echo "  > $REL would get:" >&2
+            jq . <<< "$ENTRY"
+            continue
+        fi
+        jq --argjson entry "$ENTRY" '[$entry] + .' "$FILE" > "$FILE.tmp"
+        mv "$FILE.tmp" "$FILE"
+        echo "  > Drafted $VERSION in $REL" >&2
+        echo "$REL"
+        DRAFTED=1
+    done
+    if [ -n "$DRAFTED" ]; then
+        check_inapp_files || STATUS=1
+        echo "" >&2
+        echo "  Drafted from changelog.d/ — review before building: titles are the text" >&2
+        echo "  before the first colon (six words max), feature cards carry placeholder" >&2
+        echo "  fields (inapp_feature_defaults), and the file is compiled into the app." >&2
+    fi
+    exit $STATUS
+fi
+
+# ===== Notes mode ==================================================================
+
+TERMS=$(unannounced_terms)
+UNANNOUNCED_RULE=$(unannounced_rule "$TERMS")
+if [ -n "$TERMS" ]; then
+    echo "  > Unannounced terms: $(printf '%s\n' "$TERMS" | paste -sd, - | sed 's/,/, /g')" >&2
+fi
+# release-notes-platform reads the same terms; pass them down explicitly so an
+# override given to this run reaches the nested one too.
+RELEASE_NOTES_UNANNOUNCED_TERMS=$(printf '%s\n' "$TERMS" | paste -sd, -)
+export RELEASE_NOTES_UNANNOUNCED_TERMS
+
+# --- 1. Gate: in-app What's New must already have an entry for this version ---
+# In-app changelogs are compiled into the app binary, so a missing entry ships a
+# stale What's New screen — and no deploy can fix it, only a new build. Failing
+# here (before any version file moves) aborts a release cleanly. Historically
+# this was only a warning, and best_year 1.5.3 got tagged with both in-app
+# changelogs stale. `just prerelease` drafts the entry on rc1.
+STALE_INAPP=""
+for APP_CHANGELOG in $INAPP_CHANGELOGS; do
+    if [ -f "$PROJECT_ROOT/$APP_CHANGELOG" ] && ! inapp_has_version "$PROJECT_ROOT/$APP_CHANGELOG"; then
+        STALE_INAPP="$STALE_INAPP $APP_CHANGELOG"
+    fi
+done
+if [ -n "$STALE_INAPP" ]; then
+    echo "" >&2
+    for APP_CHANGELOG in $STALE_INAPP; do
+        echo "  ⚠️  $APP_CHANGELOG has no entry for $VERSION —" >&2
+        echo "      the in-app What's New screen will be stale for this release." >&2
+    done
+    if [ -n "${ALLOW_STALE_INAPP_CHANGELOG:-}" ]; then
+        echo "  > Continuing anyway (ALLOW_STALE_INAPP_CHANGELOG set)." >&2
+    else
+        echo "" >&2
+        echo "  Draft the entries from changelog.d/ and review them, then re-run:" >&2
+        echo "      just draft-inapp-changelog $VERSION" >&2
+        echo "  Release aborted — nothing has been changed." >&2
+        exit 1
+    fi
+fi
+
+# --- 2. Store submission docs (--mobile) ---------------------------------------
+# Before anything below mutates tracked files, so a failure leaves a tree the
+# release can simply be re-run on. Fatal rather than best-effort: the flag was
+# asked for, and a release that silently went out without store copy defeats
+# it (lacta). Existing docs are kept, so copy prepared ahead of time with
+# /_release_notes survives; delete one to regenerate it.
+if [ "$MOBILE" = true ]; then
+    mkdir -p "$NOTES_DIR_FULL"
+    for PLATFORM in $HAS_PLATFORMS; do
+        PLATFORM_DOC="$NOTES_DIR/${VERSION}-${PLATFORM}.md"
+        if [ -f "$PROJECT_ROOT/$PLATFORM_DOC" ]; then
+            echo "  > $PLATFORM_DOC already exists — keeping it." >&2
+            continue
+        fi
+        FROM=$(store_live_version "$PLATFORM" "$VERSION" "$NOTES_DIR_FULL")
+        if [ -z "$FROM" ]; then
+            echo "" >&2
+            echo "  ✗ No earlier $NOTES_DIR/<ver>-${PLATFORM}.md to diff from, so the version live" >&2
+            echo "    on that store is unknown. Pass it:" >&2
+            echo "        just release ${VERSION} --mobile --${PLATFORM}-from <ver>" >&2
+            echo "  Aborted before the changelog was touched; store docs generated so far are kept." >&2
+            exit 1
+        fi
+        case "$PLATFORM" in ios) GIVEN="$IOS_FROM" ;; *) GIVEN="$ANDROID_FROM" ;; esac
+        if [ -z "$GIVEN" ]; then
+            echo "  > ${PLATFORM}: diffing from ${FROM}, the newest existing store doc (pass --${PLATFORM}-from if that never shipped)." >&2
+        fi
+        echo "  > Generating $PLATFORM_DOC (${FROM} -> ${VERSION})..." >&2
+        if ! "$SCRIPT_DIR/release-notes-platform" "$PLATFORM" "$FROM" "$VERSION" >/dev/null; then
+            echo "" >&2
+            echo "  ✗ $PLATFORM_DOC was not generated (see above). Re-run, or write it with:" >&2
+            echo "        just release-notes-${PLATFORM} ${FROM} ${VERSION}" >&2
+            echo "  Aborted before the changelog was touched; store docs generated so far are kept." >&2
+            exit 1
+        fi
+    done
+fi
+
+# --- 3. Dev notes: keep the existing doc, or generate from git history ---------
+mkdir -p "$NOTES_DIR_FULL"
+RELEASE_FILE="$NOTES_DIR_FULL/${VERSION}.md"
+if [ -f "$RELEASE_FILE" ]; then
+    # The existing file is the edited truth; delete it to regenerate. Otherwise a
+    # hand-fix is overwritten on the re-run that follows every gate abort (best_year).
+    echo "  > $NOTES_DIR/${VERSION}.md already exists — keeping it (delete it to regenerate)." >&2
+    RELEASE_NOTES=$(cat "$RELEASE_FILE")
+else
+    echo "  > Finding previous tag..." >&2
+    LAST_TAG=$(git -C "$PROJECT_ROOT" tag -l "v*" --sort=-creatordate -n0 | head -n1 || true)
+    echo "  > Last tag: ${LAST_TAG:-none}" >&2
+
+    if [ -z "$LAST_TAG" ]; then
+        GIT_LOG=$(git -C "$PROJECT_ROOT" log --oneline -30)
+        DIFF_STAT=$(git -C "$PROJECT_ROOT" diff --stat HEAD~10 2>/dev/null || echo "No diff available")
+    else
+        GIT_LOG=$(git -C "$PROJECT_ROOT" log --oneline "${LAST_TAG}..HEAD")
+        DIFF_STAT=$(git -C "$PROJECT_ROOT" diff --stat "${LAST_TAG}..HEAD")
+    fi
+    echo "  > Found $(echo "$GIT_LOG" | grep -c . || true) commits" >&2
+
+    DESC_CLAUSE=""
+    [ -n "$APP_DESC" ] && DESC_CLAUSE=" (${APP_DESC})"
+    BANNED_CLAUSE="frameworks, libraries, or technologies (e.g. Phoenix, LiveView, Ecto, Tailwind, Flutter, Dart, React, Postgres, S3, Docker${BANNED_TERMS:+, $BANNED_TERMS})"
+
+    PROMPT="You are writing release notes for the ${AUDIENCE} of ${APP_NAME}${DESC_CLAUSE} — not engineers. Write each bullet as a feature or fix the user would notice in day-to-day use, phrased as the outcome (what they will notice), not the cause.
+
+Rules:
+- Do NOT mention ${BANNED_CLAUSE}, file paths, module or function names, error class names, migrations, DOM/CSS internals, test suites, CI, or deploy plumbing.
+${UNANNOUNCED_RULE:+$UNANNOUNCED_RULE
+}- Omit any commit that is purely internal — refactors, test additions, dependency bumps, schema upgrades, CI changes, deploy fixes that didn't change user-visible behavior. It is fine to produce zero bullets in a category, or no notes at all if the release is purely internal.
+${EXTRA_RULES:+$EXTRA_RULES
+}- Use these categories as needed: Breaking Changes, New Features, Bug Fixes, Other Changes. Format each as a '### Category' heading followed by one-line bullets. Only include categories that apply.
+- Do NOT include a header with the version/date — just the categorized bullet points.
+- Output ONLY the markdown, with no preamble, commentary, or wrapping code fence.
+- If nothing in this release is user-facing (all internal work), output the single line NO_USER_FACING_CHANGES and nothing else.
+
+Commits:
+${GIT_LOG}
+
+File changes:
+${DIFF_STAT}"
+
+    echo "  > Calling Claude for release notes..." >&2
+    NOTES_FILE=$(mktemp)
+    # `--tools ""` disables all tools: with tools available the model tends to write
+    # a file and return a status sentence instead of the notes. Capture stdout only
+    # — never merge stderr (2>&1), or CLI warnings end up in the changelog.
+    # CLAUDE_RELEASE_NOTES_GENERATING makes the project's Stop hooks skip this
+    # nested run (see .claude/hooks/*), otherwise their feedback text becomes the
+    # "notes" and the test suite runs for nothing.
+    CLAUDE_RELEASE_NOTES_GENERATING=1 \
+        claude -p "$PROMPT" --model sonnet --tools "" > "$NOTES_FILE" 2>/dev/null || true
+    RELEASE_NOTES=$(cat "$NOTES_FILE")
+    rm -f "$NOTES_FILE"
+
+    # Strip a wrapping ```markdown ... ``` fence if the model added one.
+    if printf '%s' "$RELEASE_NOTES" | head -n1 | grep -qE '^```'; then
+        RELEASE_NOTES=$(printf '%s\n' "$RELEASE_NOTES" | sed '1d' | sed -e '$ { /^```$/d; }')
+    fi
+
+    # Sanity-check the shape. Real notes have at least one '### Category' heading; a
+    # purely-internal release returns the sentinel. Anything else is model
+    # commentary that would otherwise be rendered on the changelog page verbatim.
+    # Never fall back to the raw commit log: these entries are user-facing, and
+    # commit subjects are exactly the engineering jargon the prompt keeps out.
+    if [ -z "$RELEASE_NOTES" ]; then
+        echo "  > Warning: Claude returned empty — recording no user-facing changes." >&2
+        RELEASE_NOTES="_No user-facing changes in this release._"
+    elif [ "$RELEASE_NOTES" = "NO_USER_FACING_CHANGES" ]; then
+        echo "  > Release is internal-only; recording no user-facing changes." >&2
+        RELEASE_NOTES="_No user-facing changes in this release._"
+    elif ! printf '%s' "$RELEASE_NOTES" | grep -q '^###'; then
+        echo "  > Warning: output has no '### Category' heading — looks like commentary," >&2
+        echo "    not release notes. Recording no user-facing changes; edit by hand if wrong." >&2
+        echo "    Model returned: $(printf '%s' "$RELEASE_NOTES" | head -c 200)" >&2
+        RELEASE_NOTES="_No user-facing changes in this release._"
+    else
+        echo "  > Release notes generated." >&2
+    fi
+    printf '%s\n' "$RELEASE_NOTES" > "$RELEASE_FILE"
+    echo "  > Wrote $NOTES_DIR/${VERSION}.md" >&2
+fi
+
+# --- 4. Collect pending entries from changelog.d ------------------------------
+# One file per branch so open branches never share a file with a release. Each
+# file holds an entry object or an array of them; read in filename order and
+# folded into this release's items alongside anything still in the legacy
+# "unreleased" array. Consumed files are deleted below and committed by
+# bin/release (which stages the directory).
+PENDING_ITEMS="[]"
+CONSUMED_ENTRY_FILES=$(entry_files)
+if [ -n "$CONSUMED_ENTRY_FILES" ]; then
+    if ! check_entry_files --quiet; then
+        echo "  Release aborted — fix the entries above; nothing has been changed." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2086
+    PENDING_ITEMS=$(jq -s 'map(if type == "array" then .[] else . end)' $CONSUMED_ENTRY_FILES)
+    echo "  > Collected $(echo "$PENDING_ITEMS" | jq 'length') entry/entries from $CHANGELOG_DIR/." >&2
+fi
+
+# --- 5. Gate: nothing unannounced in anything this release publishes ------------
+# Runs after every doc exists but BEFORE changelog.json or changelog.d/ are
+# touched: the generated docs are new (untracked) files, so the tree stays clean
+# and `just release` can simply be re-run once the copy is fixed. Covers the dev
+# notes, every store doc for this version, the pending entries (they reach the
+# public /changelog), and this version's in-app entry (compiled into the app).
+# Incident: best_year 1.6.3 — see lib/version-files.sh.
+if [ -n "$TERMS" ]; then
+    HIT=0
+    for DOC in "$NOTES_DIR/${VERSION}.md" "$NOTES_DIR/${VERSION}-ios.md" "$NOTES_DIR/${VERSION}-android.md"; do
+        scan_unannounced "$TERMS" "$DOC" "$PROJECT_ROOT/$DOC" || HIT=1
+    done
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        scan_unannounced "$TERMS" "${f#"$PROJECT_ROOT/"}" "$f" || HIT=1
+    done <<< "$CONSUMED_ENTRY_FILES"
+    for APP_CHANGELOG in $INAPP_CHANGELOGS; do
+        [ -f "$PROJECT_ROOT/$APP_CHANGELOG" ] || continue
+        ENTRY_TMP=$(mktemp)
+        jq --arg v "$VERSION" 'map(select(.version == $v))' "$PROJECT_ROOT/$APP_CHANGELOG" > "$ENTRY_TMP" 2>/dev/null || true
+        scan_unannounced "$TERMS" "$APP_CHANGELOG ($VERSION entry)" "$ENTRY_TMP" || HIT=1
+        rm -f "$ENTRY_TMP"
+    done
+    if [ "$HIT" -ne 0 ]; then
+        echo "" >&2
+        echo "  Release copy mentions work that is not announced (release_notes.unannounced_terms)." >&2
+        echo "  Edit the files above — generated docs are kept as-is on re-run — then run the" >&2
+        echo "  release again." >&2
+        echo "  Release aborted — nothing has been committed or tagged." >&2
+        exit 1
+    fi
+    echo "  > Unannounced-terms check passed." >&2
+fi
+
+# --- 6. Update changelog.json (idempotent upsert) -----------------------------
+TODAY=$(date +%Y-%m-%d)
+if [ -n "$CHANGELOG_JSON" ]; then
+    CHANGELOG_JSON_FULL="$PROJECT_ROOT/$CHANGELOG_JSON"
+    echo "  > Updating $CHANGELOG_JSON..." >&2
+    if [ ! -f "$CHANGELOG_JSON_FULL" ]; then
+        mkdir -p "$(dirname "$CHANGELOG_JSON_FULL")"
+        echo '{"unreleased":[],"releases":[]}' > "$CHANGELOG_JSON_FULL"
+    fi
+
+    # The upsert leaves an already-populated release's items alone. In that case
+    # the pending entries were NOT folded in, so deleting their files would throw
+    # away unpublished entries — re-running this for an old version while new
+    # work is pending is exactly when that bites.
+    ITEMS_WILL_BE_CONSUMED=$(jq -r --arg tag "$VERSION" \
+        '(.releases | map(.tag_name) | index($tag)) as $idx |
+         if $idx == null then "yes"
+         elif (.releases[$idx].items | length) == 0 then "yes"
+         else "no" end' "$CHANGELOG_JSON_FULL")
+
+    jq --arg tag "$VERSION" \
+       --arg notes "$RELEASE_NOTES" \
+       --arg date "$TODAY" \
+       --argjson pending "$PENDING_ITEMS" \
+       '
+       ((.unreleased // []) + $pending) as $items |
+       (.releases | map(.tag_name) | index($tag)) as $idx |
+       if $idx != null then
+         .releases[$idx].notes = $notes |
+         .releases[$idx].published_at = $date |
+         if (.releases[$idx].items | length) == 0 and ($items | length) > 0 then
+           .releases[$idx].items = $items |
+           .unreleased = []
+         else
+           .
+         end
+       else
+         .releases = [{tag_name: $tag, notes: $notes, published_at: $date, items: $items}] + .releases |
+         .unreleased = []
+       end
+       ' "$CHANGELOG_JSON_FULL" > "${CHANGELOG_JSON_FULL}.tmp"
+    mv "${CHANGELOG_JSON_FULL}.tmp" "$CHANGELOG_JSON_FULL"
+    echo "  > $CHANGELOG_JSON updated." >&2
+
+    if [ -n "$CONSUMED_ENTRY_FILES" ] && [ "$ITEMS_WILL_BE_CONSUMED" = "yes" ]; then
+        # shellcheck disable=SC2086
+        rm -f $CONSUMED_ENTRY_FILES
+        echo "  > Cleared consumed entries from $CHANGELOG_DIR/." >&2
+    elif [ -n "$CONSUMED_ENTRY_FILES" ]; then
+        echo "  > $VERSION already has changelog items; left $CHANGELOG_DIR/ untouched." >&2
+    fi
+fi
+
+# --- 7. Warn about missing store submission docs ---------------------------------
+for PLATFORM in $HAS_PLATFORMS; do
+    if [ ! -f "$NOTES_DIR_FULL/${VERSION}-${PLATFORM}.md" ]; then
+        echo "" >&2
+        echo "  ⚠️  WARNING: $NOTES_DIR/${VERSION}-${PLATFORM}.md is missing —" >&2
+        echo "      no store submission copy prepared for this release." >&2
+        echo "      Generate it with --mobile, or: just release-notes-${PLATFORM} <version-live-on-store> ${VERSION}" >&2
+        echo "" >&2
+    fi
+done
+
+# Print only the release notes to stdout
+echo "$RELEASE_NOTES"

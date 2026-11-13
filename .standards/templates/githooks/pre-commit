@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook: per-component checks, each only when that component's files
+# are staged AND its tooling/dir exists — a docs-only or other-component commit
+# pays nothing, and a project without a component skips it silently.
+# Component-aware because Elixir-only left best_year to fork it for its TS
+# backend and website, and Flutter commits went unchecked.
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+in_dir() { (cd "$1" && shift && "$@"); }
+has_script() { jq -e --arg s "$2" '.scripts[$s] // empty' "$1/package.json" >/dev/null 2>&1; }
+
+# --- Elixir: format (re-add), compile warnings-as-errors, test ---------------
+EX_FILES=$(echo "$STAGED" | grep -E '\.(ex|exs)$' || true)
+if [ -n "$EX_FILES" ]; then
+    WEBAPP_DIR=$([ -d webapp ] && echo webapp || echo .)
+    echo "==> Pre-commit: Elixir ($WEBAPP_DIR)"
+    in_dir "$WEBAPP_DIR" mix format
+    echo "$EX_FILES" | xargs git add
+    in_dir "$WEBAPP_DIR" mix compile --warnings-as-errors
+    in_dir "$WEBAPP_DIR" mix test --max-failures=5
+fi
+
+# --- TS/JS components: build / test / lint scripts that the package defines ---
+# One pass per top-level dir with a package.json (backend/functions style nested
+# packages: the nearest package.json under the top-level dir wins).
+for pkg in $(echo "$STAGED" | grep -E '\.(ts|tsx|js|jsx)$' | grep -v '^webapp/' \
+        | while IFS= read -r f; do
+            d=$(dirname "$f")
+            while [ "$d" != . ] && [ ! -f "$d/package.json" ]; do d=$(dirname "$d"); done
+            [ "$d" != . ] && echo "$d"
+          done | sort -u); do
+    echo "==> Pre-commit: $pkg"
+    for s in build lint test; do
+        # CI=true: keeps jest/vitest out of watch mode.
+        has_script "$pkg" "$s" && CI=true in_dir "$pkg" npm run --silent "$s"
+    done
+done
+
+# --- Flutter: analyze --------------------------------------------------------
+if echo "$STAGED" | grep -qE '^mobile/.*\.dart$' && [ -f mobile/pubspec.yaml ] && command -v flutter >/dev/null; then
+    echo "==> Pre-commit: mobile"
+    # Git sets GIT_DIR (and friends) while a hook runs. Flutter reads its own
+    # version from its SDK's git checkout, so with them set it reads this
+    # repo instead, reports 0.0.0-unknown, and pub refuses to resolve.
+    in_dir mobile env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE flutter analyze
+fi
+
+echo "==> Pre-commit: All checks passed"

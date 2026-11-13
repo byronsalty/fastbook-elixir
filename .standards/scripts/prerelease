@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prerelease — bump version and build numbers for a TESTER build, without
+# tagging.
+#
+# Why this exists: `just release` is the only supported way to tag, and a tag
+# triggers the prod deploy. So there was no way to put a build of an unreleased
+# version in front of TestFlight / Play internal testers without either shipping
+# prod or hand-editing the version files — and hand-editing is how the version
+# files drift out of step with the tag.
+#
+# This does the version arithmetic and nothing else: no tests, no tag, no push.
+# The tag then marks the version testers approved rather than the first guess.
+#
+#   just prerelease 0.34.0        # bump to 0.34.0, build N+1
+#   just android-release          # .aab for Play internal testing
+#   just ios-release              # archive for TestFlight
+#   # ...upload, gather feedback, fix bugs...
+#   just prerelease 0.34.0        # SAME version again -> build N+2
+#   just release 0.34.0           # when testers are happy
+#
+# VERSION gets an "-rcN" suffix (0.34.0-rc1, then -rc2, ...) so the repo says
+# out loud that v0.34.0 is not tagged yet and which candidate is out with
+# testers. The app files get the bare number: iOS CFBundleShortVersionString must
+# be numeric period-separated or App Store Connect rejects the build. `just
+# release` overwrites VERSION with the bare number.
+#
+# The bump is COMMITTED by default. `bin/release` refuses to run against a dirty
+# tree (it stages version files by name then commits the whole index), so leaving
+# the bumps unstaged would dead-end the very next command. Committing also makes
+# each tester build reproducible from a named commit — useful when someone asks
+# what was in TestFlight build 249. Pass --no-commit to opt out.
+#
+# rc1 also drafts the in-app What's New (release_notes.inapp_changelogs) from
+# the pending changelog.d/ entries, into the same commit: those files are
+# compiled into the binary, so the entry must exist before the tester build that
+# gets promoted to the store — this step, not `just release`, which only gates
+# on it (best_year 1.5.3 was tagged with both files stale). Later candidates warn
+# while a file still lacks the version, so a stale build is caught before upload.
+#
+# Version-file logic is shared with `release` via lib/version-files.sh, so the
+# two can't drift.
+
+resolve_script_dir() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+CONFIG_FILE="$PROJECT_ROOT/release-config.json"
+
+# shellcheck source=lib/version-files.sh
+source "$SCRIPT_DIR/lib/version-files.sh"
+
+VERSION=""
+DO_COMMIT=true
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-commit) DO_COMMIT=false ;;
+        --help|-h)
+            echo "Usage: bin/prerelease <version> [--no-commit]"
+            echo ""
+            echo "Bump VERSION (to <version>-rcN) and every configured version file for a"
+            echo "tester build, without tagging. Re-run with the same version to bump build"
+            echo "numbers for the next TestFlight / Play upload."
+            echo ""
+            echo "Current version: $(cat "$PROJECT_ROOT/VERSION")"
+            exit 0 ;;
+        -*) echo "Error: unknown option $arg" >&2; exit 1 ;;
+        *)
+            if [ -n "$VERSION" ]; then
+                echo "Error: version given twice ($VERSION, $arg)" >&2
+                exit 1
+            fi
+            VERSION="$arg" ;;
+    esac
+done
+
+if [ -z "$VERSION" ]; then
+    echo "Usage: bin/prerelease <version> [--no-commit]" >&2
+    exit 1
+fi
+
+if ! validate_semver "$VERSION"; then
+    echo "Error: Version must be semver (e.g. 1.2.3 or 1.2.3.1)" >&2
+    exit 1
+fi
+
+TAG="v${VERSION}"
+
+# A tagged version is already released; bumping build numbers onto it would
+# produce store builds that claim to be a version that shipped something else.
+if git -C "$PROJECT_ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
+    echo "Error: Tag ${TAG} already exists — that version has shipped." >&2
+    echo "Pick the next version number for tester builds." >&2
+    exit 1
+fi
+
+# rc number: continue the sequence if VERSION already holds <version>-rcN.
+CURRENT=$(cat "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "")
+RC=1
+if [[ "$CURRENT" =~ ^${VERSION//./\\.}-rc([0-9]+)$ ]]; then
+    RC=$((BASH_REMATCH[1] + 1))
+fi
+
+echo "==> Prereleasing v${VERSION}-rc${RC} (no tag, no push)..."
+
+echo "${VERSION}-rc${RC}" > "$PROJECT_ROOT/VERSION"
+echo "  > VERSION -> ${VERSION}-rc${RC}"
+FILES_TO_COMMIT=("VERSION")
+
+CHANGED=$(bump_version_files "$VERSION")
+while IFS= read -r f; do [ -n "$f" ] && FILES_TO_COMMIT+=("$f"); done <<< "$CHANGED"
+
+# In-app What's New (skipped silently when none are configured).
+INAPP_CHANGELOGS=""
+[ -f "$CONFIG_FILE" ] && INAPP_CHANGELOGS=$(jq -r '(.release_notes.inapp_changelogs // []) | .[]' "$CONFIG_FILE")
+if [ -n "$INAPP_CHANGELOGS" ]; then
+    if [ "$RC" -eq 1 ]; then
+        # Never block a tester build on the draft; the warning below and the
+        # release gate are the backstops.
+        if DRAFTED=$("$SCRIPT_DIR/release-notes" --draft-inapp "$VERSION"); then
+            while IFS= read -r f; do [ -n "$f" ] && FILES_TO_COMMIT+=("$f"); done <<< "$DRAFTED"
+        else
+            echo "  ⚠️  Drafting the in-app What's New failed (see above)."
+        fi
+    fi
+    for f in $INAPP_CHANGELOGS; do
+        if [ -f "$PROJECT_ROOT/$f" ] && \
+           ! jq -e --arg v "$VERSION" 'map(select(.version == $v)) | length > 0' "$PROJECT_ROOT/$f" >/dev/null 2>&1; then
+            echo "  ⚠️  $f has no entry for $VERSION — a build uploaded now ships a stale"
+            echo "      What's New. Run: just draft-inapp-changelog $VERSION"
+        fi
+    done
+fi
+
+echo ""
+
+if [ "$DO_COMMIT" = true ]; then
+    # Stage by name — `bin/release` commits the whole index, so leaving unrelated
+    # work staged is how it ends up in a release commit; the same care applies here.
+    git -C "$PROJECT_ROOT" add -- "${FILES_TO_COMMIT[@]}"
+    if git -C "$PROJECT_ROOT" diff --cached --quiet; then
+        echo "==> Nothing changed — version files were already at v${VERSION} with this build."
+        exit 0
+    fi
+    git -C "$PROJECT_ROOT" commit -m "Prerelease v${VERSION}-rc${RC}" --quiet
+    echo "==> Committed 'Prerelease v${VERSION}-rc${RC}' (not pushed, not tagged)."
+else
+    echo "==> Version files bumped, left uncommitted (--no-commit)."
+    echo "    Note: 'just release' refuses a dirty tree — commit or stash before tagging."
+fi
+
+echo ""
+echo "Next:"
+printf '  %-32s # %s\n' "just android-release" "build for Play internal testing"
+printf '  %-32s # %s\n' "just ios-release" "archive for TestFlight"
+printf '  %-32s # %s\n' "just prerelease ${VERSION}" "again, for the next tester build"
+printf '  %-32s # %s\n' "just release ${VERSION}" "when testers are happy"

@@ -1,0 +1,31 @@
+{
+  "version_files": [
+    { "path": "webapp/mix.exs", "sed": "s/version: \"[^\"]*\"/version: \"VERSION\"/" },
+    { "path": "mobile/pubspec.yaml", "type": "flutter_pubspec" },
+    { "path": "ios/App.xcodeproj/project.pbxproj", "type": "xcode_pbxproj" },
+    { "path": "android/app/build.gradle.kts", "type": "android_gradle" }
+  ],
+  "changelog": true,
+  "changelog_json": "changelog.json",
+  "changelog_dir": "changelog.d",
+  "default_branch": "main",
+  "changelog_ignore_paths": ["marketing/"],
+  "audit_targets": ["webapp", { "path": "webapp/assets", "context": "bundled into the browser" }],
+  "release_notes": {
+    "dir": "marketing/release_notes",
+    "app_name": "MyApp",
+    "app_description": "a one-line description of what the app does and for whom",
+    "audience": "end users",
+    "banned_terms": "Oban, DaisyUI",
+    "extra_rules": [],
+    "unannounced_terms": ["premium", "subscription"],
+    "closing_line": "Thank you for using MyApp!",
+    "platforms": {
+      "ios": { "paths": ["mobile/", ":(exclude)mobile/android"] },
+      "android": { "paths": ["mobile/", ":(exclude)mobile/ios"] }
+    },
+    "inapp_changelogs": [],
+    "inapp_feature_defaults": { "icon": "sparkles" },
+    "inapp_required_feature_fields": ["icon"]
+  }
+}

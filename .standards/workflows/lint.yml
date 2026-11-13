@@ -1,0 +1,45 @@
+name: Lint
+
+# Static analysis that is too slow (dialyzer) or too noisy (credo) for the
+# per-PR gate. Runs on demand and weekly; promote individual steps into
+# pr-webapp.yml once they are clean. Keep the schedule: a dispatch-only lint
+# (lacta's copy) runs only when someone remembers to run it.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      # PROJECT: pinned to match webapp/Dockerfile (pr-webapp.yml checks it).
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3.4"
+          elixir-version: "1.18.4"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            webapp/deps
+            webapp/_build
+            webapp/priv/plts
+          key: ${{ runner.os }}-lint-${{ hashFiles('webapp/mix.lock') }}
+      - run: mix deps.get
+      # `success() || failure()`: report every tool's findings in one run
+      # instead of stopping at the first red step.
+      - run: mix format --check-formatted
+        if: success() || failure()
+      - run: mix credo --strict --min-priority high
+        if: success() || failure()
+      - run: mix dialyzer
+        continue-on-error: true

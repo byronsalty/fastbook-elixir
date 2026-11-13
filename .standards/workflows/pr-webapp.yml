@@ -1,0 +1,180 @@
+name: pr-webapp
+
+# Cheap PR gate for the webapp: compile with warnings-as-errors, format check,
+# a few ALWAYS-RUN guard tests, and a seeded random sample of the rest. The full
+# suite runs locally on every Claude turn (stop-test.sh), in the pre-commit
+# hook, and as the release gate (`just release` -> `just test`); on the tag,
+# test.yml runs everything again. The point of this workflow is a fast signal
+# on every PR without paying for the whole suite each push.
+#
+# Two rules, both learned the hard way (lacta):
+#   * Anything that guards a CONVENTION (changelog entries, sender addresses,
+#     schema snapshots, compliance suites) must be pinned outside the sample.
+#     At a 10% sample a convention guard fires on ~1 PR in 10, which is how a
+#     violation ships on a green run (lacta #433).
+#   * CI toolchain pins must be checked against the Dockerfile. A stale CI pin
+#     means CI stops testing what ships (the OTP 27.2 TLS breakage).
+#
+# Lines marked `# PROJECT:` are the per-project knobs.
+on:
+  pull_request:
+    paths:
+      - "webapp/**"
+      - ".github/workflows/pr-webapp.yml"
+
+# Cancel superseded runs on the same ref (a new push to a PR) to save minutes.
+concurrency:
+  group: pr-webapp-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  webapp:
+    name: webapp (checks + sampled mix test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    env:
+      MIX_ENV: test
+      # PROJECT: match config/test.exs.
+      TEST_DB_PORT: "5432"
+      # PROJECT: percentage of test FILES to sample per PR run.
+      SAMPLE_PERCENT: "10"
+      # PROJECT: space-separated path globs (relative to webapp/) that are
+      # NEVER drawn into the sample: opt-in suites that need live API keys or a
+      # deployed environment. Worse, a test_helper.exs that auto-enables
+      # `integration: true` when it sees one of these paths in argv switches on
+      # EVERY integration test in the run when a single file from them is
+      # sampled (lacta test/llm/).
+      SAMPLE_EXCLUDE: "test/llm/* test/integration/* test/staging/*"
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test  # PROJECT: match config/test.exs
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # webapp/Dockerfile is the single source of truth for the BEAM and Node
+      # versions. A stale CI pin means CI stops testing what ships — which is
+      # how the OTP 27.2 TLS breakage reached prod unnoticed (lacta). Every
+      # workflow that pins otp-version/elixir-version is checked, so lint.yml /
+      # security.yml / deploy test jobs can't drift either.
+      - name: CI pins match webapp/Dockerfile
+        # The job defaults to working-directory: webapp; this step reads paths
+        # from the repo root, so it opts back out.
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          otp=$(sed -n 's/^ARG OTP_VERSION=//p' webapp/Dockerfile)
+          elixir=$(sed -n 's/^ARG ELIXIR_VERSION=//p' webapp/Dockerfile)
+          # Empty when the image doesn't install Node (stock Phoenix uses the
+          # esbuild/tailwind binaries) — then there is nothing to pin.
+          node=$(sed -n 's|.*deb\.nodesource\.com/setup_\([0-9][0-9]*\)\.x.*|\1|p' webapp/Dockerfile | head -1)
+          echo "webapp/Dockerfile declares Elixir $elixir / OTP $otp / Node ${node:-none}"
+          rc=0
+          for wf in $(grep -l 'otp-version:' .github/workflows/*.yml); do
+            grep -q "otp-version: \"$otp\"" "$wf" \
+              || { echo "::error file=$wf::otp-version does not match Dockerfile ($otp)"; rc=1; }
+            grep -q "elixir-version: \"$elixir\"" "$wf" \
+              || { echo "::error file=$wf::elixir-version does not match Dockerfile ($elixir)"; rc=1; }
+          done
+          # Only this workflow installs Node for the webapp (the assets lockfile
+          # check below); other workflows' node-version belongs to other
+          # components.
+          if [ -n "$node" ]; then
+            grep -q "node-version: \"$node\"" .github/workflows/pr-webapp.yml \
+              || { echo "::error file=.github/workflows/pr-webapp.yml::node-version does not match Dockerfile ($node)"; rc=1; }
+          fi
+          exit $rc
+
+      # Only for webapps whose assets have a package-lock.json (stock Phoenix
+      # has none). PROJECT: pinned to match webapp/Dockerfile (nodesource
+      # setup_<N>.x).
+      - uses: actions/setup-node@v7
+        if: hashFiles('webapp/assets/package-lock.json') != ''
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webapp/assets/package-lock.json
+
+      # webapp/Dockerfile builds assets with `npm ci`, which hard-fails if
+      # package.json and package-lock.json have drifted apart. That image is
+      # built only by the tag-triggered deploy, so without this step the drift
+      # first surfaces *after* `just release` has already bumped the version
+      # files, tagged and pushed — recoverable only by a hotfix bump (lacta).
+      # Catch it here instead, for a couple of seconds per PR.
+      - name: Assets lockfile is in sync
+        if: hashFiles('webapp/assets/package-lock.json') != ''
+        working-directory: webapp/assets
+        run: npm ci --dry-run
+
+      # PROJECT: pinned to match webapp/Dockerfile (checked above).
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3.4"
+          elixir-version: "1.18.4"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            webapp/deps
+            webapp/_build
+          key: ${{ runner.os }}-mix-${{ hashFiles('webapp/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - run: mix deps.get
+
+      # Warnings-as-errors mirrors `mix precommit` and the local dev gate.
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+
+      # OPTIONAL — Ash projects only. Ash generates migrations by diffing
+      # resources against priv/resource_snapshots/, so a snapshot that doesn't
+      # match reality makes the generator actively dangerous; twice a schema
+      # change merged without its snapshot on a green PR (lacta). Needs no
+      # database. Catches omission, not a snapshot regenerated from a wrong
+      # resource.
+      # - name: Ash resource snapshots match the resources
+      #   run: mix ash_postgres.generate_migrations --check
+
+      # ---- Always-run guards (never sampled) --------------------------------
+      # PROJECT: one line per convention guard. Examples:
+      #   - run: mix test test/<app>_web/live/changelog_live_test.exs
+      #   - run: mix test.hipaa
+      - run: mix test test/*_web/live/changelog_live_test.exs
+
+      # ---- Seeded random sample of everything else --------------------------
+      - name: Run a random ${{ env.SAMPLE_PERCENT }}% sample of test files
+        run: |
+          # Seed the shuffle with the run id so re-running this job re-runs the
+          # SAME sample (a red run can't go green by drawing new files).
+          seeded_random() {
+            openssl enc -aes-256-ctr -pass pass:"${{ github.run_id }}" -nosalt </dev/zero 2>/dev/null
+          }
+          # SAMPLE_EXCLUDE (top of job): never draw from opt-in suites — one
+          # sampled integration file can switch on every integration test.
+          # (read -a splits without pathname-expanding the globs.)
+          read -ra globs <<< "$SAMPLE_EXCLUDE"
+          excludes=()
+          for glob in "${globs[@]}"; do excludes+=(-not -path "$glob"); done
+          mapfile -t all < <(find test -name '*_test.exs' "${excludes[@]}" | sort)
+          total=${#all[@]}
+          n=$(( (total * SAMPLE_PERCENT + 99) / 100 ))
+          mapfile -t sample < <(printf '%s\n' "${all[@]}" | shuf --random-source=<(seeded_random) -n "$n")
+          echo "Sampled $n of $total test files (${SAMPLE_PERCENT}%):"
+          printf '%s\n' "${sample[@]}"
+          mix test "${sample[@]}"

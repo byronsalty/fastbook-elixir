@@ -1,0 +1,137 @@
+name: Deploy Self-Hosted
+
+# Production deploys on a v* tag (cut by `just release`). Push-to-main deploys
+# belong to a staging workflow (copy this file, trigger on `branches: [main]`,
+# point it at the staging compose service).
+#
+# Lines marked `# PROJECT:` are the per-project knobs. Repo settings used:
+#   vars.PROJECT_PATH     checkout on the runner host (holds deploy/compose.yml)
+#   secrets.ROYALE_URL    Royale base URL for the failure alert (optional)
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency: deploy
+
+env:
+  PROJECT_PATH: ${{ vars.PROJECT_PATH }}
+  # PROJECT: the compose service that runs the app.
+  APP_SERVICE: app
+  # PROJECT: health endpoint as reachable FROM the runner host, and the body
+  # substring a healthy response contains.
+  HEALTHCHECK_URL: http://localhost:4000/healthcheck
+  HEALTHCHECK_EXPECT: '"status":"OK"'
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Pull latest code
+        run: |
+          cd "$PROJECT_PATH"
+          git checkout -- .
+          git fetch --tags origin
+          git checkout main
+          git pull origin main
+
+      # A bare `git tag` still triggers this deploy but ships code WITHOUT the
+      # version bump `just release` makes (lacta v0.16.3–v0.16.5). Fail fast
+      # when the tag doesn't match the version file the app compiles in.
+      # PROJECT: VERSION_FILE / VERSION_REGEX.
+      - name: Verify tag matches shipped version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION_FILE: webapp/mix.exs
+          VERSION_REGEX: 'version: "([^"]*)"'
+        run: |
+          cd "$PROJECT_PATH"
+          TAG="${GITHUB_REF_NAME#v}"
+          SHIPPED="$(grep -oE "$VERSION_REGEX" "$VERSION_FILE" | head -1 | sed -E "s/$VERSION_REGEX/\\1/")"
+          if [ "$TAG" != "$SHIPPED" ]; then
+            echo "::error::Tag v$TAG does not match $VERSION_FILE version $SHIPPED. Release with 'just release <version>'."
+            exit 1
+          fi
+
+      - name: Build webapp image
+        run: |
+          cd "$PROJECT_PATH/deploy"
+          docker compose build "$APP_SERVICE"
+
+      - name: Run migrations
+        run: |
+          cd "$PROJECT_PATH/deploy"
+          docker compose run --rm "$APP_SERVICE" bin/migrate
+
+      # PROJECT: add the reverse proxy (caddy) here if its config ships with
+      # the app.
+      - name: Restart app
+        run: |
+          cd "$PROJECT_PATH/deploy"
+          docker compose up -d --force-recreate "$APP_SERVICE"
+
+      # A single successful curl is not proof of life: an app whose Chrome
+      # cannot start serves /healthcheck for a few seconds before its
+      # supervisor gives up and the BEAM exits, and `restart: unless-stopped`
+      # brings it straight back — so a one-shot probe can land in the window
+      # and call a crash loop "healthy" (this is how lacta's v0.42.x bookworm
+      # images shipped). Require the app to stay healthy for a sustained
+      # stretch AND the container to have never restarted.
+      - name: Sustained health check
+        run: |
+          cd "$PROJECT_PATH/deploy"
+          required=6      # consecutive OK probes, 5s apart (~30s of stability)
+          deadline=$((SECONDS + 180))
+          ok=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if curl -sf -m 10 "$HEALTHCHECK_URL" | grep -qF "$HEALTHCHECK_EXPECT"; then
+              ok=$((ok + 1))
+              echo "OK ($ok/$required)"
+              if [ "$ok" -ge "$required" ]; then
+                container=$(docker compose ps -q "$APP_SERVICE")
+                restarts=$(docker inspect --format '{{.RestartCount}}' "$container")
+                state=$(docker inspect --format '{{.State.Status}}' "$container")
+                if [ "$restarts" != "0" ] || [ "$state" != "running" ]; then
+                  echo "::error::Container is $state with $restarts restart(s) — treating as a crash loop"
+                  docker compose logs "$APP_SERVICE" --tail 60
+                  exit 1
+                fi
+                echo "Healthy: stable for $required probes, 0 restarts"
+                exit 0
+              fi
+            else
+              [ "$ok" -gt 0 ] && echo "Probe failed after $ok OK probe(s) — resetting"
+              ok=0
+            fi
+            sleep 5
+          done
+          echo "::error::Never stayed healthy for $required consecutive probes within 180s"
+          docker compose ps
+          docker compose logs "$APP_SERVICE" --tail 60
+          exit 1
+
+  # Report a failed prod deploy the moment it happens rather than when someone
+  # notices (lacta deploy.yml / deploy-staging.yml). The prior container may
+  # already be replaced, so this can mean prod is down or crash-looping.
+  notify-failure:
+    name: Notify on failure
+    needs: deploy
+    if: failure()
+    runs-on: self-hosted
+    steps:
+      - name: Report deploy failure to Royale
+        env:
+          ROYALE_URL: ${{ secrets.ROYALE_URL }}
+          ALERT_TYPE: ${{ github.event.repository.name }}_prod_deploy_failure
+        run: |
+          if [ -z "$ROYALE_URL" ]; then
+            echo "::warning::ROYALE_URL secret not set — no alert sent"
+            exit 0
+          fi
+          # Every interpolated value is a repo/ref/URL (no quotes), so plain
+          # string JSON is safe without depending on jq on the runner host.
+          details="${GITHUB_REPOSITORY} PROD deploy failed for ${GITHUB_REF_NAME} on ${GITHUB_SHA::8} - prod may be down or crash-looping; check ${HEALTHCHECK_URL}. Logs: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -sf -X POST "$ROYALE_URL/api/mcp" \
+            -H "Content-Type: application/json" \
+            -d "{\"message_type\": \"report_system_alert\", \"args\": {\"type\": \"${ALERT_TYPE}\", \"details\": \"${details}\"}}" \
+            || echo "::warning::could not send failure notification"

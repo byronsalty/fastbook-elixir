@@ -1,0 +1,92 @@
+name: test
+
+# The full suite. Expensive, so it runs at release time (v* tags cut by
+# `just release`, which already ran `just test` locally before tagging) and on
+# demand; PR-time checks are the cheaper pr-<component>.yml gates. A small
+# project with no pr-* gate can add `pull_request:` here instead.
+# Note this run does not gate the deploy workflow — both fire on the tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  webapp:
+    name: webapp (mix test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    env:
+      MIX_ENV: test
+      # PROJECT: match config/test.exs.
+      TEST_DB_PORT: "5432"
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test  # PROJECT: match config/test.exs
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # Literal pins, not ${{ vars.* }}: pr-webapp.yml checks every workflow's
+      # otp-version/elixir-version against webapp/Dockerfile, and a pin that
+      # lives in repo settings can drift from what ships without any diff.
+      # PROJECT: pinned to match webapp/Dockerfile.
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3.4"
+          elixir-version: "1.18.4"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            webapp/deps
+            webapp/_build
+          key: ${{ runner.os }}-mix-${{ hashFiles('webapp/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - run: mix deps.get
+      # Warnings-as-errors mirrors `mix precommit` and the local dev gate.
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      # The `test` alias creates and migrates the test DB on the service above.
+      - run: mix test
+
+  # PROJECT: one job per shipping component, mirroring `just test` — a
+  # component missing here (and from `just test`) can ship broken (best_year
+  # tagged iOS code that did not compile). Flutter example:
+  # mobile:
+  #   name: mobile (flutter test)
+  #   runs-on: ubuntu-latest
+  #   defaults:
+  #     run:
+  #       working-directory: mobile
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - uses: subosito/flutter-action@v2
+  #       with:
+  #         flutter-version: "3.44.1"
+  #         channel: stable
+  #         cache: true
+  #     - run: flutter pub get
+  #     - run: flutter analyze
+  #     - run: flutter test

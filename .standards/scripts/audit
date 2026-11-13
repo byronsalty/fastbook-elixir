@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Report dependency vulnerabilities that actually reach something we ship.
+#
+#   bin/audit             detail: one block per package tree, advisories listed
+#   bin/audit --summary   one line per affected package tree (for `just deps`)
+#
+# Why: `npm install` prints an audit summary on every run, which is how 41
+# findings became scenery during `just release` in best_year — the wrong moment
+# to learn about them and the wrong altitude to act on them. Install with
+# `--no-audit --no-fund` and call this in --summary mode instead.
+#
+# npm trees are audited with --omit=dev: a vulnerable Jest or Vite plugin runs
+# on a laptop against our own source, while a vulnerable dependency of a
+# deployed backend runs in production against user input. Only the second kind
+# belongs in a release-time warning.
+#
+# This NEVER exits nonzero. Advisories appear without anyone here changing a
+# line, and a release — including a hotfix — must not be blocked by upstream
+# publishing one. It informs; you decide. (security.yml is where audits fail.)
+#
+# Targets come from release-config.json `audit_targets` — each entry a directory
+# (relative to the project root), or an object naming where that code runs:
+#
+#   "audit_targets": [
+#     { "path": "backend/functions", "context": "deployed to Cloud Functions" },
+#     { "path": "website",           "context": "build-time only (static site)" },
+#     { "path": "webapp",            "context": "production webapp" },
+#     "tools"
+#   ]
+#
+# A directory with package-lock.json is audited with npm; one with mix.exs gets
+# `mix hex.audit` (retired packages) and `mix deps.audit` (advisories; needs the
+# mix_audit dep). Without `audit_targets`, every directory up to three levels
+# deep holding a package-lock.json (outside node_modules) is audited; mix
+# projects are only audited when listed.
+#
+# Needs: jq, python3; npm / mix for the respective targets.
+
+resolve_root() {
+    local root
+    root="$(cd "$(dirname "$0")/.." && pwd)"
+    [ "$(basename "$root")" = ".standards" ] && root="$(dirname "$root")"
+    echo "$root"
+}
+PROJECT_ROOT="$(resolve_root)"
+CONFIG_FILE="$PROJECT_ROOT/release-config.json"
+
+MODE="full"
+case "${1:-}" in
+    --summary) MODE="summary" ;;
+    "") ;;
+    *) echo "Usage: bin/audit [--summary]" >&2; exit 1 ;;
+esac
+
+# path|context lines
+targets() {
+    if [ -f "$CONFIG_FILE" ] && jq -e 'has("audit_targets")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        jq -r '.audit_targets[] | if type == "string" then "\(.)|" else "\(.path)|\(.context // "")" end' "$CONFIG_FILE"
+    else
+        (cd "$PROJECT_ROOT" && find . -maxdepth 3 -name package-lock.json -not -path '*/node_modules/*' -exec dirname {} \; \
+            | sed 's|^\./||' | sort | sed 's/$/|/')
+    fi
+}
+
+RENDER_PY='
+import json, os, sys
+
+raw = os.environ.get("AUDIT_JSON", "").strip()
+if not raw:
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    sys.exit(0)
+
+counts = data.get("metadata", {}).get("vulnerabilities", {})
+total = counts.get("total", 0)
+if not total:
+    sys.exit(0)
+
+name, context, mode = os.environ["NAME"], os.environ["CONTEXT"], os.environ["MODE"]
+headline = ", ".join(
+    "{} {}".format(counts[sev], sev)
+    for sev in ("critical", "high", "moderate", "low")
+    if counts.get(sev)
+)
+word = "vulnerability" if total == 1 else "vulnerabilities"
+print("  {}: {} production {} ({}){}".format(name, total, word, headline, " - " + context if context else ""))
+
+if mode == "summary":
+    sys.exit(0)
+
+# Detail: one block per advisory root, direct dependencies first, since those
+# are the ones a version bump here can actually fix.
+RANK = {"critical": 0, "high": 1, "moderate": 2, "low": 3}
+roots = [
+    v for v in data.get("vulnerabilities", {}).values()
+    if any(isinstance(via, dict) for via in v.get("via", []))
+]
+roots.sort(key=lambda v: (not v.get("isDirect"), RANK.get(v.get("severity"), 9), v["name"]))
+for v in roots:
+    direct = " [direct dependency]" if v.get("isDirect") else ""
+    fix = v.get("fixAvailable")
+    if isinstance(fix, dict):
+        note = "fix: {}@{}".format(fix.get("name"), fix.get("version"))
+        if fix.get("isSemVerMajor"):
+            note += " (BREAKING)"
+    elif fix:
+        note = "fix available"
+    else:
+        note = "no fix available"
+    print("    {:<9}{}{} - {}".format(v.get("severity", "?"), v["name"], direct, note))
+    for via in v.get("via", []):
+        if isinstance(via, dict):
+            print("              {}".format(via.get("title", "")))
+'
+
+audit_npm() {  # audit_npm DIR NAME CONTEXT
+    if [ ! -d "$1/node_modules" ]; then
+        [ "$MODE" = "full" ] && echo "  $2: not installed (just deps)"
+        return 0
+    fi
+    local json
+    # npm audit exits nonzero whenever it finds anything; that is not an error here.
+    json=$( (cd "$1" && npm audit --omit=dev --json 2>/dev/null) || true )
+    AUDIT_JSON="$json" NAME="$2" CONTEXT="$3" MODE="$MODE" python3 -c "$RENDER_PY" || true
+}
+
+audit_mix() {  # audit_mix DIR NAME CONTEXT
+    if [ ! -d "$1/deps" ]; then
+        [ "$MODE" = "full" ] && echo "  $2: not installed (just deps)"
+        return 0
+    fi
+    local suffix="${3:+ - $3}" out n
+    # hex.audit exits nonzero when it finds retired packages; capture, don't fail.
+    out=$( (cd "$1" && mix hex.audit 2>&1) || true )
+    n=$(grep -cE '^[a-z_0-9]+ +[0-9]' <<<"$out" || true)
+    if [ "${n:-0}" -gt 0 ]; then
+        echo "  $2: $n retired hex package(s)$suffix"
+        [ "$MODE" = "full" ] && sed 's/^/    /' <<<"$out"
+    fi
+    if (cd "$1" && mix help deps.audit >/dev/null 2>&1); then
+        out=$( (cd "$1" && mix deps.audit 2>&1) || true )
+        n=$(grep -c '^Name:' <<<"$out" || true)
+        if [ "${n:-0}" -gt 0 ]; then
+            echo "  $2: $n hex advisory(ies)$suffix"
+            [ "$MODE" = "full" ] && sed 's/^/    /' <<<"$out"
+        fi
+    elif [ "$MODE" = "full" ]; then
+        echo "  $2: mix deps.audit unavailable (add {:mix_audit, only: [:dev, :test], runtime: false})"
+    fi
+}
+
+FOUND_ANY=0
+while IFS='|' read -r REL CONTEXT; do
+    [ -n "$REL" ] || continue
+    DIR="$PROJECT_ROOT/$REL"
+    OUTPUT=""
+    if [ -f "$DIR/package-lock.json" ]; then
+        command -v npm >/dev/null 2>&1 && OUTPUT+=$(audit_npm "$DIR" "$REL" "$CONTEXT")
+    fi
+    if [ -f "$DIR/mix.exs" ]; then
+        command -v mix >/dev/null 2>&1 && OUTPUT+=$(audit_mix "$DIR" "$REL" "$CONTEXT")
+    fi
+    if [ ! -f "$DIR/package-lock.json" ] && [ ! -f "$DIR/mix.exs" ] && [ "$MODE" = "full" ]; then
+        echo "  $REL: no package-lock.json or mix.exs — check audit_targets"
+    fi
+    if [ -n "$OUTPUT" ]; then
+        # "not installed" notes alone don't count as findings.
+        grep -qv 'not installed\|unavailable' <<<"$OUTPUT" && FOUND_ANY=1
+        [ "$MODE" = "full" ] && echo ""
+        echo "$OUTPUT"
+    fi
+done < <(targets)
+
+if [ "$FOUND_ANY" = "1" ]; then
+    if [ "$MODE" = "summary" ]; then
+        echo "  (details: just audit)"
+    else
+        echo ""
+        echo "Before running 'npm audit fix': read what it wants to install."
+        echo "A fix that swaps a transitive dependency for a young, low-traffic"
+        echo "package is a bigger risk than the advisory it closes - check the"
+        echo "'add' lines in 'npm audit fix --dry-run' first."
+    fi
+elif [ "$MODE" = "full" ]; then
+    echo "No production vulnerabilities."
+fi
+exit 0

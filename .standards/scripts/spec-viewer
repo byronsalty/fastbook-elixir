@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""spec-viewer — browse spec/ in a local web viewer, with any branch's proposed changes.
+
+The docs viewer from .standards/process/how-we-build.md: a web view of the
+living spec, including the proposed changes on any request branch. Git and the
+files in spec/ stay the source of truth; this only reads them.
+
+  * Navigation from the fixed layout (README, requirements/, design/, glossary).
+  * Every PREFIX-NN requirement and DEC-NN decision gets an anchor; bare
+    numbers become links (hover for the text), unknown numbers are flagged,
+    and each item lists what references it.
+  * Glossary terms link to their definition wherever they appear.
+  * "Review" compares a branch with its merge-base on the base branch
+    (SPEC_BASE, default main) by requirement, not by line: new, changed,
+    retired and deleted requirements, decisions and glossary terms as
+    before/after pairs. A change under design/ means the branch needs
+    Engineering review. `_review?from=<ref>` compares with any other point.
+  * "History" lists the commits on the base branch that changed spec/, each
+    opening the same Review for that commit against its parent.
+  * working/ at the project root holds temporary lists (gaps, todos, open
+    questions, actions for a person). It is listed under "Working" and left
+    out of Review and History.
+
+Changes are computed from git on every request, like `git diff`; nothing about
+a change is stored outside the spec itself.
+
+Any local or remote branch, or any commit, can be viewed. A branch checked out
+in a worktree is read from that worktree, so uncommitted edits show too.
+
+Every page is rendered on request: edit spec/, reload the browser.
+
+Usage: bin/spec-viewer [--port N] [--open]   (a busy port: the next free one up)
+Requires: python3, pandoc, git.
+"""
+
+import argparse
+import difflib
+import errno
+import html
+import json
+import mimetypes
+import os
+import posixpath
+import re
+import subprocess
+import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+BASE_BRANCH = os.environ.get("SPEC_BASE", "main")
+ROOT = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                      text=True, check=True).stdout.strip()
+
+
+def project_name():
+    """The project's directory name, the same from every worktree: with several
+    projects' viewers open side by side, the tab and sidebar say whose spec this is.
+    Worktrees live at <project>/<branch> with the primary checkout at
+    <project>/main, so the name comes from the shared git dir, not the worktree."""
+    if os.environ.get("SPEC_PROJECT"):
+        return os.environ["SPEC_PROJECT"]
+    common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    top = os.path.dirname(common) if common.endswith("/.git") else ROOT
+    if os.path.basename(top) == BASE_BRANCH:
+        top = os.path.dirname(top)
+    return os.path.basename(top) or "spec"
+
+
+PROJECT = project_name()
+# One hue per project name, so two viewers' tabs and sidebars look different at a glance.
+PROJECT_HUE = sum(ord(c) * 31 ** i for i, c in enumerate(PROJECT)) % 360
+
+
+# ── git ──────────────────────────────────────────────────────────────────────
+
+def git(*args, cwd=ROOT, binary=False):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=not binary)
+    return r.stdout if r.returncode == 0 else None
+
+
+def worktrees():
+    """branch name → worktree path, plus 'HEAD' → this checkout."""
+    out, path, wts = git("worktree", "list", "--porcelain") or "", None, {}
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("branch refs/heads/"):
+            wts[line[18:]] = path
+    wts["HEAD"] = ROOT
+    return wts
+
+
+def branches():
+    local = (git("for-each-ref", "--format=%(refname:short)", "refs/heads") or "").split()
+    remote = [r for r in (git("for-each-ref", "--format=%(refname:short)", "refs/remotes") or "").split()
+              if not r.endswith("/HEAD") and r.split("/", 1)[-1] not in local]
+    return local, remote
+
+
+def current_branch():
+    b = (git("branch", "--show-current") or "").strip()
+    return b or "HEAD"
+
+
+class Source:
+    """The spec as it is on one branch: a worktree on disk, or a git ref."""
+
+    def __init__(self, ref):
+        self.ref = ref
+        self.path = worktrees().get(ref)
+        if self.path is None and (ref.startswith("-") or git("rev-parse", "--verify", "--quiet", ref + "^{commit}") is None):
+            raise LookupError(ref)
+        self.commit = (git("rev-parse", "HEAD", cwd=self.path) if self.path else git("rev-parse", ref)).strip()
+        self.dirty = bool(self.path and (git("status", "--porcelain", "--", "spec", "working", cwd=self.path) or "").strip())
+        self._cache = {}
+
+    def files(self):
+        """Paths relative to spec/, plus the project's working/ lists as `working/...`."""
+        if self.path:
+            spec = os.path.join(self.path, "spec")
+            out = [os.path.relpath(os.path.join(d, f), spec).replace(os.sep, "/")
+                   for d, _, fs in os.walk(spec) for f in fs]
+            out += [os.path.relpath(os.path.join(d, f), self.path).replace(os.sep, "/")
+                    for d, _, fs in os.walk(os.path.join(self.path, "working")) for f in fs]
+            return sorted(out)
+        out = git("ls-tree", "-r", "--name-only", self.commit, "--", "spec/", "working/") or ""
+        return sorted(p[5:] if p.startswith("spec/") else p for p in out.splitlines())
+
+    @staticmethod
+    def repo_path(rel):
+        return rel if rel.startswith("working/") else "spec/" + rel
+
+    def read(self, rel, binary=False):
+        key = (rel, binary)
+        if key not in self._cache:
+            if self.path:
+                try:
+                    with open(os.path.join(self.path, self.repo_path(rel)), "rb") as f:
+                        data = f.read()
+                except OSError:
+                    data = None
+            else:
+                data = git("show", f"{self.commit}:{self.repo_path(rel)}", binary=True)
+            if data is not None and not binary:
+                data = data.decode("utf-8", "replace")
+            self._cache[key] = data
+        return self._cache[key]
+
+
+class BaseSource(Source):
+    """The spec at a commit (the merge-base, or a chosen point to compare with)."""
+
+    def __init__(self, commit):
+        self.ref, self.path, self.commit, self.dirty, self._cache = commit[:8], None, commit, False, {}
+
+
+def base_for(src):
+    mb = git("merge-base", BASE_BRANCH, src.commit)
+    return BaseSource(mb.strip()) if mb else None
+
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree: "before the first commit"
+
+
+def resolve(ref):
+    """A ref or commit-ish (`main`, `a1b2c3d`, `a1b2c3d^`) → full commit hash, or None.
+    `root` is the empty spec before the first commit."""
+    if ref == "root":
+        return EMPTY_TREE
+    if not ref or ref.startswith("-"):
+        return None
+    out = git("rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    return out.strip() if out else None
+
+
+def spec_history(limit=200):
+    """Commits on the base branch that changed spec/, newest first: [(commit, parent, date, subject)]."""
+    out = git("log", "--first-parent", "-n", str(limit), "--format=%H%x09%P%x09%ad%x09%s",
+              "--date=short", BASE_BRANCH, "--", "spec/") or ""
+    rows = []
+    for line in out.splitlines():
+        c, parents, date, subject = (line.split("\t", 3) + ["", "", ""])[:4]
+        rows.append((c, (parents.split() or [None])[0], date, subject))
+    return rows
+
+
+# ── spec model ───────────────────────────────────────────────────────────────
+
+ITEM_RE = re.compile(r"^- (~~)?\*\*([A-Z]{2,5}-\d+)\*\*(.*)$")
+
+
+def frontmatter(text):
+    m = re.match(r"---\n(.*?)\n---\n?", text or "", re.S)
+    if not m:
+        return {}, text or ""
+    meta = {}
+    for line in m.group(1).splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            meta[k.strip()] = v.strip()
+    return meta, text[m.end():]
+
+
+def parse_items(text, page):
+    """Numbered list items: {id: {id, text, retired, page}} in file order."""
+    items, cur = {}, None
+    for line in (text or "").splitlines():
+        m = ITEM_RE.match(line)
+        if m:
+            cur = {"id": m.group(2), "retired": bool(m.group(1)), "page": page,
+                   "lines": [("~~**%s**" % m.group(2) if m.group(1) else "") + m.group(3)]}
+            items[m.group(2)] = cur
+        elif cur and line.startswith((" ", "\t")) and line.strip():
+            cur["lines"].append(line.strip())
+        else:
+            cur = None
+    for it in items.values():
+        first = it["lines"][0]
+        if it["retired"]:  # "~~**ID** text~~ Retired: why" → "text~~ Retired: why" → keep readable
+            first = re.sub(r"^~~\*\*[A-Z]+-\d+\*\*\s*", "", first)
+            first = first.replace("~~", "", 1)
+        it["text"] = "\n".join([first.strip()] + it["lines"][1:])
+        del it["lines"]
+    return items
+
+
+def parse_glossary(text):
+    """{term: definition}. HTML comments (section markers such as
+    `<!-- Scheduling -->`) belong to no term, so they are dropped."""
+    terms, cur = {}, None
+    body = re.sub(r"<!--.*?-->", "", frontmatter(text)[1], flags=re.S)
+    for line in body.splitlines():
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            terms[cur] = []
+        elif cur is not None:
+            terms[cur].append(line)
+    return {t: "\n".join(b).strip() for t, b in terms.items()}
+
+
+def short(ref):
+    """A commit hash shortened for display; branch names as they are."""
+    if ref == EMPTY_TREE:
+        return "empty spec"
+    return ref[:8] if re.fullmatch(r"[0-9a-f]{40}", ref) else ref
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+class Spec:
+    def __init__(self, src):
+        self.src = src
+        self.files = src.files()
+        self.areas = []      # (prefix, area name, page)
+        self.items = {}      # id → item (requirements + decisions)
+        readme = src.read("README.md") or ""
+        order = {p: readme.find(p) for p in self.files}
+        for p in sorted((f for f in self.files if re.match(r"requirements/[A-Z]{2,5}-[^/]*\.md$", f)),
+                        key=lambda f: (order[f] < 0, order[f], f)):
+            meta, body = frontmatter(src.read(p))
+            prefix = meta.get("prefix") or p.split("/")[1].split("-")[0]
+            name = meta.get("area") or p.split("-", 1)[1][:-3].replace("-", " ").title()
+            self.areas.append((prefix, name, p))
+            self.items.update(parse_items(body, p))
+        if "design/decisions.md" in self.files:
+            self.items.update(parse_items(src.read("design/decisions.md"), "design/decisions.md"))
+        self.glossary = parse_glossary(src.read("glossary.md")) if "glossary.md" in self.files else {}
+        self.prefixes = sorted({a[0] for a in self.areas} | {"DEC"} | {i.split("-")[0] for i in self.items})
+        self.refby = {}
+        for it in self.items.values():
+            for r in set(self.id_re().findall(it["text"])) - {it["id"]}:
+                self.refby.setdefault(r, []).append(it["id"])
+
+    def id_re(self):
+        return re.compile(r"\b(?:%s)-\d+\b" % "|".join(self.prefixes))
+
+
+def compare(spec, base):
+    """id/term → status ('new', 'changed', 'retired', 'deleted') and the base version."""
+    if base is None:
+        return {}, {}, []
+    out = {}
+    for k, it in spec.items.items():
+        old = base.items.get(k)
+        if old is None:
+            out[k] = ("new", None)
+        elif it["retired"] and not old["retired"]:
+            out[k] = ("retired", old)
+        elif norm(it["text"]) != norm(old["text"]) or it["retired"] != old["retired"]:
+            out[k] = ("changed", old)
+    for k, old in base.items.items():
+        if k not in spec.items:
+            out[k] = ("deleted", old)
+    terms = {}
+    for t, d in spec.glossary.items():
+        if t not in base.glossary:
+            terms[t] = ("new", None)
+        elif norm(d) != norm(base.glossary[t]):
+            terms[t] = ("changed", base.glossary[t])
+    for t, d in base.glossary.items():
+        if t not in spec.glossary:
+            terms[t] = ("deleted", d)
+    other = [f for f in sorted(set(spec.files) | set(base.files))
+             if f.endswith(".md") and not f.startswith(("requirements/", "working/"))
+             and f not in ("glossary.md", "design/decisions.md")
+             and spec.src.read(f) != base.src.read(f)]
+    return out, terms, other
+
+
+def design_changes(status, other):
+    """What under design/ changed (decision numbers, other design pages): any means Engineering review."""
+    decs = sorted((k for k in status if k.startswith("DEC-")), key=lambda k: int(k.split("-")[1]))
+    return decs + [f for f in other if f.startswith("design/")]
+
+
+def norm(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+# ── rendering ────────────────────────────────────────────────────────────────
+
+def pandoc(md):
+    r = subprocess.run(["pandoc", "-f", "gfm", "-t", "html5"], input=md, capture_output=True, text=True)
+    if r.returncode:
+        return "<pre>%s</pre>" % html.escape(r.stderr)
+    return r.stdout
+
+
+def hard_breaks(md):
+    """Continuation lines of a numbered item ("  Reason: …") render on their own line."""
+    out, in_item = [], False
+    for line in md.splitlines():
+        if ITEM_RE.match(line):
+            in_item = True
+        elif in_item and line.startswith((" ", "\t")) and line.strip() and not re.match(r"\s*([-*+]|\d+\.)\s", line):
+            out[-1] = out[-1].rstrip() + "  "
+        else:
+            in_item = False
+        out.append(line)
+    return "\n".join(out)
+
+
+def inline_md(s, href_base=""):
+    """Inline markdown (bold, strike, code, links, em) for a single requirement's text."""
+    s = html.escape(s, quote=False)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"~~(.+?)~~", r"<del>\1</del>", s)
+    s = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
+               lambda m: '<a href="%s">%s</a>' % (m.group(2) if re.match(r"\w+:|/|#", m.group(2))
+                                                   else href_base + m.group(2), m.group(1)), s)
+    return s.replace("\n", "<br>")
+
+
+def plain(s):
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s or "")
+    return re.sub(r"[*~`]", "", s)
+
+
+def word_diff(old, new):
+    a, b = re.split(r"(\s+)", plain(old)), re.split(r"(\s+)", plain(new))
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op in ("delete", "replace"):
+            out.append("<del>%s</del>" % html.escape("".join(a[i1:i2])))
+        if op in ("insert", "replace"):
+            out.append("<ins>%s</ins>" % html.escape("".join(b[j1:j2])))
+        if op == "equal":
+            out.append(html.escape("".join(a[i1:i2])))
+    return "".join(out).replace("\n", "<br>")
+
+
+class Linker:
+    """Turns bare requirement numbers and glossary terms in text into links."""
+
+    SKIP = {"a", "code", "pre", "script", "style", "h1", "h2", "title", "select", "option"}
+
+    def __init__(self, spec, base_url, link_terms=True):
+        self.spec, self.base_url = spec, base_url
+        terms = {}
+        if link_terms:
+            for t in spec.glossary:
+                forms = {t, t + "s", t + "es"}
+                if t.endswith("y"):
+                    forms.add(t[:-1] + "ies")
+                for f in forms:
+                    terms[f.lower()] = t
+        self.terms = terms
+        alts = ["(?P<id>%s)" % spec.id_re().pattern]
+        if terms:
+            alts.append(r"(?P<term>(?i:\b(?:%s)\b))" % "|".join(
+                re.escape(f) for f in sorted(terms, key=len, reverse=True)))
+        self.re = re.compile("|".join(alts))
+
+    def id_link(self, i):
+        it = self.spec.items.get(i)
+        if not it:
+            return '<span class="broken" title="No such requirement or decision">%s</span>' % i
+        title = html.escape(plain(it["text"])[:240], quote=True)
+        return '<a class="ref" href="%s%s#%s" title="%s">%s</a>' % (self.base_url, it["page"], i, title, i)
+
+    def term_link(self, word):
+        t = self.terms[word.lower()]
+        title = html.escape(plain(self.spec.glossary[t]).split("\n")[0][:240], quote=True)
+        return '<a class="term" href="%sglossary.md#%s" title="%s">%s</a>' % (
+            self.base_url, slug(t), title, html.escape(word))
+
+    def __call__(self, page_html):
+        out, skip = [], []
+        for part in re.split(r"(<[^>]+>)", page_html):
+            if part.startswith("<"):
+                m = re.match(r"<(/?)([a-zA-Z0-9]+)", part)
+                if m and m.group(2).lower() in self.SKIP:
+                    if m.group(1):
+                        if skip:
+                            skip.pop()
+                    elif not part.endswith("/>"):
+                        skip.append(m.group(2))
+                out.append(part)
+            elif skip or not part.strip():
+                out.append(part)
+            else:
+                out.append(self.re.sub(lambda m: self.id_link(m.group("id")) if m.group("id")
+                                       else self.term_link(m.group("term")), part))
+        return "".join(out)
+
+
+BADGE = {"new": "New", "changed": "Changed", "retired": "Retired", "deleted": "Deleted"}
+
+
+def badge(status):
+    return '<span class="badge %s">%s</span>' % (status, BADGE[status])
+
+
+def decorate_items(body, spec, status, base_label):
+    """Anchor every numbered item, mark its status vs the base, and list what references it."""
+    pat = re.compile(r"<li>(\s*<p>)?(<del>)?<strong>([A-Z]{2,5}-\d+)</strong>")
+    pieces, pos = [], 0
+    for m in pat.finditer(body):
+        i = m.group(3)
+        if i not in spec.items:
+            continue
+        st = status.get(i)
+        close = body.find("</li>", m.end())
+        pieces.append(body[pos:m.start()])
+        pieces.append('<li id="%s" class="req%s">%s%s<a class="num" href="#%s">%s</a>%s' % (
+            i, " " + st[0] if st else "", m.group(1) or "", m.group(2) or "", i, i, badge(st[0]) if st else ""))
+        extra = []
+        if st and st[0] in ("changed", "retired"):
+            extra.append('<details class="prev"><summary>Compare with %s</summary><div class="diff">%s</div></details>'
+                         % (html.escape(base_label), word_diff(st[1]["text"], spec.items[i]["text"])))
+        refs = spec.refby.get(i)
+        if refs:
+            extra.append('<div class="refby">Referenced by %s</div>' % ", ".join(sorted(refs)))
+        pieces.append(body[m.end():close] + "".join(extra))
+        pos = close
+    pieces.append(body[pos:])
+    return "".join(pieces)
+
+
+# ── pages ────────────────────────────────────────────────────────────────────
+
+class Page:
+    def __init__(self, src, base_url, frm=None):
+        """`frm`: a commit to compare with instead of the merge-base on the base branch."""
+        self.src, self.base_url = src, base_url
+        self.spec = Spec(src)
+        bsrc = BaseSource(frm) if frm else base_for(src)
+        self.base = Spec(bsrc) if bsrc else None
+        self.base_commit = bsrc.commit if bsrc else None
+        self.base_label = short(frm) if frm else BASE_BRANCH
+        self.status, self.terms, self.other = compare(self.spec, self.base)
+        self.design = design_changes(self.status, self.other)
+
+    def n_changes(self):
+        return len(self.status) + len(self.terms) + len(self.other)
+
+    def shell(self, title, body, current, link_terms=True):
+        spec, b = self.spec, self.base_url
+
+        def nav(path, label, extra=""):
+            cls = ' class="here"' if path == current else ""
+            return '<a href="%s%s"%s>%s%s</a>' % (b, path, cls, html.escape(label), extra)
+
+        def count_for(page):
+            n = sum(1 for k, v in self.status.items() if (spec.items.get(k) or v[1])["page"] == page)
+            return ' <span class="count">%d</span>' % n if n else ""
+
+        n = self.n_changes()
+        side = [nav("", "Overview"),
+                nav("_review", "Review changes",
+                    ' <span class="count hot">%d</span>' % n if n else ""),
+                nav("_history", "History"),
+                "<h3>Requirements</h3>"]
+        side += [nav(p, "%s · %s" % (pre, name), count_for(p)) for pre, name, p in spec.areas]
+        side.append("<h3>Design</h3>")
+        side += [nav(f, label, count_for(f) if f == "design/decisions.md" else "")
+                 for f, label in (("design/overview.md", "Overview"), ("design/decisions.md", "Decisions"))
+                 if f in spec.files]
+        side += [nav(f, posixpath.basename(f)[:-3].replace("-", " ").capitalize())
+                 for f in spec.files if f.startswith("design/") and f.endswith(".md")
+                 and f not in ("design/overview.md", "design/decisions.md")]
+        side.append("<h3>Reference</h3>")
+        if "glossary.md" in spec.files:
+            side.append(nav("glossary.md", "Glossary",
+                            ' <span class="count">%d</span>' % len(self.terms) if self.terms else ""))
+        working = [f for f in spec.files if f.startswith("working/") and f.endswith(".md")]
+        if working:
+            side.append("<h3>Working</h3>")
+            side += [nav(f, posixpath.basename(f)[:-3].replace("-", " ").replace("_", " ").capitalize())
+                     for f in working]
+
+        local, remote = branches()
+        wts = worktrees()
+        opts = []
+        for r in local + remote:
+            sel = " selected" if r == self.src.ref else ""
+            note = " (worktree)" if r in wts and r != "HEAD" else ""
+            opts.append('<option value="%s"%s>%s%s</option>' % (html.escape(quote(r, safe="")), sel,
+                                                                html.escape(r), note))
+        if self.src.ref not in local + remote:
+            opts.insert(0, '<option selected value="%s">%s</option>' % (html.escape(quote(self.src.ref, safe="")),
+                                                                         html.escape(short(self.src.ref))))
+        state = "uncommitted edits included" if self.src.dirty else self.src.commit[:8]
+        jump = {i: b + it["page"] + "#" + i for i, it in spec.items.items()}
+        linked = Linker(spec, b, link_terms)(body)
+        return TEMPLATE.format(
+            project=html.escape(PROJECT), hue=PROJECT_HUE, title=html.escape(title), branches="".join(opts), state=html.escape(state),
+            base=html.escape(self.base_label), sidebar="\n".join(side), body=linked,
+            jump=json.dumps(jump).replace("</", "<\\/"), sub=html.escape(current))
+
+    # individual pages
+
+    def markdown(self, rel):
+        text = self.src.read(rel)
+        meta, md = frontmatter(text)
+        body = pandoc(hard_breaks(md))
+        body = re.sub(r'(href|src)="(?![a-z]+:|/|#)([^"]+)"',
+                      lambda m: '%s="%s%s"' % (m.group(1), self.base_url,
+                                               posixpath.normpath(posixpath.join(posixpath.dirname(rel), m.group(2)))
+                                               + ("/" if m.group(2).endswith("/") else "")), body)
+        body = decorate_items(body, self.spec, self.status, self.base_label)
+        if rel == "glossary.md":
+            def h2(m):
+                term = re.sub(r"<[^>]+>", "", m.group(2))
+                st = self.terms.get(html.unescape(term))
+                extra = ""
+                if st:
+                    extra = " " + badge(st[0])
+                    if st[0] == "changed":
+                        extra += ('<details class="prev"><summary>Compare with %s</summary><div class="diff">%s</div>'
+                                  "</details>" % (html.escape(self.base_label),
+                                                  word_diff(st[1], self.spec.glossary[html.unescape(term)])))
+                return '<h2 id="%s">%s%s</h2>' % (slug(html.unescape(term)), m.group(2), extra)
+            body = re.sub(r"<h2([^>]*)>(.*?)</h2>", h2, body)
+        deleted = [k for k, v in self.status.items() if v[0] == "deleted" and v[1]["page"] == rel]
+        if deleted:
+            body = ('<div class="warn"><strong>Deleted:</strong> %s were removed instead of retired. '
+                    "Numbers are never removed; strike them through with a reason.</div>"
+                    % ", ".join(deleted)) + body
+        if rel.startswith("working/"):
+            body = ('<div class="banner quiet">A working list, not part of the spec: '
+                    "each entry is removed once it is answered or fixed.</div>") + body
+        title = re.search(r"<h1[^>]*>(.*?)</h1>", body)
+        return self.shell(re.sub(r"<[^>]+>", "", title.group(1)) if title else rel, body, rel,
+                          link_terms=rel != "glossary.md")
+
+    def listing(self, d):
+        body = ""
+        if d + "README.md" in self.spec.files:
+            body = pandoc(frontmatter(self.src.read(d + "README.md"))[1])
+        else:
+            body = "<h1>%s</h1>" % html.escape(d)
+        rows = []
+        for f in self.spec.files:
+            if f.startswith(d) and f != d + "README.md" and "/" not in f[len(d):]:
+                head = frontmatter(self.src.read(f) or "")[1].lstrip().split("\n")[0].lstrip("# ") \
+                    if f.endswith(".md") else ""
+                rows.append('<li><a href="%s%s">%s</a><br><span class="muted">%s</span></li>'
+                            % (self.base_url, f, html.escape(posixpath.basename(f)), html.escape(head)))
+        body += '<h2>Files</h2><ul class="files">%s</ul>' % "".join(rows)
+        return self.shell(d, body, d)
+
+    def home(self):
+        body = pandoc(frontmatter(self.src.read("README.md") or "# spec/\n\nNo README.md.")[1])
+        body = re.sub(r'(href|src)="(?![a-z]+:|/|#)([^"]+)"',
+                      lambda m: '%s="%s%s"' % (m.group(1), self.base_url, m.group(2)), body)
+        return self.shell("Spec", self.banner() + body, "")
+
+    def review_href(self):
+        return self.base_url + "_review" + ("?from=" + quote(self.base_commit) if self.base_label != BASE_BRANCH else "")
+
+    def signoff(self):
+        """Engineering review follows from the diff: anything under design/ changed."""
+        if not self.design:
+            return ""
+        return ('<div class="banner signoff"><strong>Engineering review needed:</strong> the design changes (%s).</div>'
+                % html.escape(", ".join(self.design)))
+
+    def banner(self):
+        if self.base is None:
+            return '<div class="banner">No <code>%s</code> branch to compare with.</div>' % html.escape(BASE_BRANCH)
+        if not self.n_changes():
+            return ('<div class="banner quiet">No spec changes against <code>%s</code>.</div>'
+                    % html.escape(self.base_label))
+        counts = {}
+        for st, _ in self.status.values():
+            counts[st] = counts.get(st, 0) + 1
+        parts = ["%d %s" % (v, k) for k, v in sorted(counts.items())]
+        reqs = ", ".join(parts) or "no requirement or decision changes"
+        return ('<a class="banner" href="%s"><strong>Proposed on %s</strong> against %s. '
+                "Requirements and decisions: %s.%s <span class=\"go\">Review →</span></a>"
+                % (self.review_href(), html.escape(short(self.src.ref)), html.escape(self.base_label), reqs,
+                   " Engineering review needed." if self.design else ""))
+
+    def history(self):
+        b = "/b/"
+        out = ["<h1>History</h1>",
+               '<p class="muted">Commits on <code>%s</code> that changed <code>spec/</code>, newest first. '
+               "Each opens the review of that commit against its parent, computed from git.</p>"
+               % html.escape(BASE_BRANCH)]
+        rows = spec_history()
+        if not rows:
+            out.append('<div class="banner quiet">No commits on <code>%s</code> have changed <code>spec/</code> yet.</div>'
+                       % html.escape(BASE_BRANCH))
+        else:
+            out.append('<ul class="files">')
+            for c, parent, date, subject in rows:
+                href = "%s%s/_review?from=%s" % (b, c, parent or "root")
+                out.append('<li><a href="%s">%s</a> <span class="muted">%s · <code>%s</code></span></li>'
+                           % (href, html.escape(subject), html.escape(date), c[:8]))
+            out.append("</ul>")
+        return self.shell("History", "\n".join(out), "_history")
+
+    def review(self):
+        spec, b = self.spec, self.base_url
+        if self.base is None:
+            return self.shell("Review", "<h1>Review</h1>" + self.banner(), "_review")
+        if self.base_label == BASE_BRANCH:
+            against = "<code>%s</code> at its merge-base <code>%s</code>" % (html.escape(BASE_BRANCH),
+                                                                            self.base_commit[:8])
+        else:
+            against = "<code>%s</code>" % html.escape(self.base_label)
+        out = ["<h1>Review: %s</h1>" % html.escape(short(self.src.ref)),
+               '<p class="muted">Compared with %s%s, by requirement number.</p>'
+               % (against, "; uncommitted edits included" if self.src.dirty else ""),
+               self.signoff()]
+
+        def group(title, keys):
+            if not keys:
+                return
+            out.append("<h2>%s</h2>" % title)
+            out.append('<ul class="items">')
+            for k in keys:
+                st, old = self.status[k]
+                it = spec.items.get(k) or old
+                href = b + it["page"] + "#" + k
+                if st == "new":
+                    text = inline_md(it["text"], b)
+                elif st == "deleted":
+                    text = '<span class="was">%s</span> <em class="muted">Removed; numbers are never ' \
+                           "reused, retire it instead.</em>" % inline_md(old["text"], b)
+                else:
+                    text = '<div class="diff">%s</div>' % word_diff(old["text"], it["text"])
+                out.append('<li class="req %s"><a class="num" href="%s">%s</a> %s %s</li>'
+                           % (st, href, k, badge(st), text))
+            out.append("</ul>")
+
+        def key(k):
+            p, n = k.split("-")
+            return (p, int(n))
+
+        pages = [(name + " (" + pre + ")", p) for pre, name, p in spec.areas]
+        pages.append(("Design decisions", "design/decisions.md"))
+        seen = set()
+        for title, p in pages:
+            ks = sorted((k for k, v in self.status.items() if (spec.items.get(k) or v[1])["page"] == p), key=key)
+            seen.update(ks)
+            group(title, ks)
+        group("Other", sorted(set(self.status) - seen, key=key))
+
+        if self.terms:
+            out.append('<h2>Glossary</h2><ul class="items">')
+            for t, (st, old) in sorted(self.terms.items()):
+                new = spec.glossary.get(t, "")
+                text = inline_md(new, b) if st == "new" else (
+                    '<span class="was">%s</span>' % inline_md(old, b) if st == "deleted"
+                    else '<div class="diff">%s</div>' % word_diff(old, new))
+                out.append('<li class="req %s"><a class="num" href="%sglossary.md#%s">%s</a> %s %s</li>'
+                           % (st, b, slug(t), html.escape(t), badge(st), text))
+            out.append("</ul>")
+        if self.other:
+            out.append("<h2>Other spec pages changed</h2>")
+            for f in self.other:
+                old, new = self.base.src.read(f), self.src.read(f)
+                st = "new" if old is None else "deleted" if new is None else "changed"
+                diff = "" if st != "changed" else '<div class="diff block">%s</div>' % word_diff(old, new)
+                link = '<a href="%s%s">%s</a>' % (b, f, html.escape(f)) if new is not None else html.escape(f)
+                out.append('<details class="other"><summary>%s %s</summary>%s</details>' % (link, badge(st), diff))
+        if not (self.status or self.terms or self.other):
+            out.append('<p class="muted">No requirement, decision, glossary or page changes.</p>')
+        return self.shell("Review · " + short(self.src.ref), "\n".join(out), "_review")
+
+
+# ── server ───────────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", headers=()):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        try:
+            self.route()
+        except BrokenPipeError:
+            pass
+        except Exception as e:  # show the error in the browser, keep serving
+            self.send(500, "<pre>%s</pre>" % html.escape(repr(e)))
+
+    def route(self):
+        url = urlsplit(self.path)
+        path = url.path
+        segs = path.split("/")
+        if len(segs) < 3 or segs[1] != "b":
+            return self.send(302, "", headers=[("Location", "/b/%s/" % quote(current_branch(), safe=""))])
+        ref, rel = unquote(segs[2]), unquote("/".join(segs[3:]))
+        if rel and (rel.startswith("/") or ".." in rel.split("/")):
+            return self.send(404, "Not found")
+        try:
+            src = Source(ref)
+        except LookupError:
+            return self.send(404, "<p>No branch <code>%s</code>. <a href='/'>Back</a></p>" % html.escape(ref))
+        frm = None
+        if rel == "_review":
+            want = parse_qs(url.query).get("from", [""])[0]
+            if want:
+                frm = resolve(want)
+                if frm is None:
+                    return self.send(404, "<p>No commit <code>%s</code> to compare with. <a href='/'>Back</a></p>"
+                                     % html.escape(want))
+        page = Page(src, "/b/%s/" % quote(ref, safe=""), frm)
+        if rel in ("", "README.md"):
+            return self.send(200, page.home())
+        if rel == "_review":
+            return self.send(200, page.review())
+        if rel == "_history":
+            return self.send(200, page.history())
+        if rel.endswith("/") or (rel + "/" in {posixpath.dirname(f) + "/" for f in page.spec.files}):
+            if not rel.endswith("/"):
+                return self.send(302, "", headers=[("Location", page.base_url + rel + "/")])
+            return self.send(200, page.listing(rel))
+        if rel not in page.spec.files:
+            return self.send(404, page.shell("Not found", "<h1>Not found</h1><p><code>spec/%s</code> isn't on "
+                                                          "this branch.</p>" % html.escape(rel), rel))
+        if rel.endswith(".md"):
+            return self.send(200, page.markdown(rel))
+        ctype = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        return self.send(200, src.read(rel, binary=True), ctype)
+
+
+def serve(port, tries=20):
+    """Bind the first free port from `port` up: a second viewer (another worktree,
+    another project) shouldn't fail on the one already running."""
+    for p in range(port, port + tries):
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", p), Handler)
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+    sys.exit("spec-viewer: ports %d-%d are all in use" % (port, port + tries - 1))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Browse spec/ with each branch's proposed changes.")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("SPEC_PORT", "4800")))
+    ap.add_argument("--open", action="store_true", help="open the browser")
+    args = ap.parse_args()
+    for tool in ("pandoc",):
+        if subprocess.run(["which", tool], capture_output=True).returncode:
+            sys.exit("spec-viewer: %s is required (brew install %s)" % (tool, tool))
+    srv = serve(args.port)
+    url = "http://127.0.0.1:%d/" % srv.server_address[1]
+    print("Spec viewer for %s on %s  (comparing with %s; Ctrl-C to stop)" % (PROJECT, url, BASE_BRANCH))
+    if args.open:
+        threading.Timer(0.3, webbrowser.open, [url]).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{project} · {title}</title>
+<style>
+:root {{
+  --bg:#fbfaf7; --panel:#f2f0ea; --text:#1f2328; --muted:#6a6f76; --line:#dedad0; --accent:#2f5d8a;
+  --new:#1f7a3f; --new-bg:#e3f4e8; --chg:#8a5a00; --chg-bg:#fbf0d4; --ret:#5c6066; --ret-bg:#eceae4;
+  --del:#a3262a; --del-bg:#fbe3e2; --mark:#fff6c9;
+  --proj:hsl({hue} 55% 42%); --proj-bg:hsl({hue} 60% 92%);
+}}
+@media (prefers-color-scheme: dark) {{ :root {{
+  --bg:#16181b; --panel:#1e2125; --text:#e4e6e9; --muted:#9aa0a8; --line:#33373d; --accent:#8cb7e6;
+  --new:#7fd69a; --new-bg:#163322; --chg:#f0c56a; --chg-bg:#3a2e12; --ret:#b3b8bf; --ret-bg:#2a2d31;
+  --del:#ff8d88; --del-bg:#3d1b1b; --mark:#3a3418;
+  --proj:hsl({hue} 65% 70%); --proj-bg:hsl({hue} 35% 20%);
+}} }}
+* {{ box-sizing:border-box }}
+body {{ margin:0; background:var(--bg); color:var(--text);
+  font:16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }}
+a {{ color:var(--accent); text-decoration:none }} a:hover {{ text-decoration:underline }}
+.wrap {{ display:grid; grid-template-columns:270px minmax(0,1fr); min-height:100vh }}
+aside {{ background:var(--panel); border-right:1px solid var(--line); padding:1rem .75rem;
+  position:sticky; top:0; height:100vh; overflow:auto; font-size:.92rem }}
+body {{ border-top:4px solid var(--proj) }}
+aside {{ top:4px; height:calc(100vh - 4px) }}
+aside .brand {{ margin:0 0 .8rem; padding:.55rem .7rem; border-radius:8px; background:var(--proj-bg);
+  border-left:4px solid var(--proj) }}
+aside .brand .project {{ display:block; font-size:1.25rem; font-weight:700; line-height:1.2; color:var(--proj);
+  overflow-wrap:anywhere }}
+aside .brand .sub {{ display:block; font-size:.75rem; color:var(--muted); letter-spacing:.04em }}
+aside select, aside input {{ width:100%; font:inherit; padding:.35rem .5rem; border:1px solid var(--line);
+  border-radius:6px; background:var(--bg); color:var(--text); margin-bottom:.4rem }}
+aside .state {{ color:var(--muted); font-size:.8rem; margin:0 .5rem .8rem }}
+aside h3 {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted);
+  margin:1.1rem .5rem .3rem }}
+aside a {{ display:block; padding:.22rem .5rem; border-radius:6px; color:var(--text) }}
+aside a:hover {{ background:var(--line); text-decoration:none }}
+aside a.here {{ background:var(--accent); color:var(--bg) }}
+.count {{ float:right; font-size:.75rem; background:var(--chg-bg); color:var(--chg); border-radius:9px;
+  padding:0 .45rem; margin-top:.15rem }}
+.count.hot {{ background:var(--accent); color:var(--bg) }}
+a.here .count {{ background:var(--bg); color:var(--accent) }}
+main {{ padding:2rem 3rem 5rem; max-width:900px }}
+h1 {{ font-size:1.9rem; line-height:1.25; margin:.2rem 0 1rem }}
+h2 {{ font-size:1.3rem; margin:2rem 0 .6rem; padding-bottom:.25rem; border-bottom:1px solid var(--line) }}
+h3 {{ font-size:1.05rem; margin:1.4rem 0 .4rem }}
+blockquote {{ margin:1rem 0; padding:.2rem 1rem; border-left:3px solid var(--line); color:var(--muted) }}
+code {{ font:.88em ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--panel); padding:.1em .3em;
+  border-radius:4px }}
+pre {{ background:var(--panel); padding:.8rem 1rem; border-radius:8px; overflow:auto }} pre code {{ background:none }}
+table {{ border-collapse:collapse; margin:1rem 0; font-size:.94rem; width:100% }}
+th, td {{ border:1px solid var(--line); padding:.4rem .6rem; text-align:left; vertical-align:top }}
+th {{ background:var(--panel) }}
+img {{ max-width:100% }}
+li.req {{ list-style:none; margin:0 0 .7rem -1.4rem; padding:.35rem .6rem; border-radius:8px;
+  border-left:3px solid transparent }}
+li.req:target {{ background:var(--mark) }}
+li.req.new {{ border-left-color:var(--new) }} li.req.changed {{ border-left-color:var(--chg) }}
+li.req.retired {{ border-left-color:var(--ret) }} li.req.deleted {{ border-left-color:var(--del) }}
+a.num {{ font-weight:700; font-variant-numeric:tabular-nums; margin-right:.35rem; color:var(--text) }}
+.badge {{ font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.05em; padding:.05rem .4rem;
+  border-radius:4px; vertical-align:2px; margin-right:.25rem }}
+.badge.new {{ background:var(--new-bg); color:var(--new) }} .badge.changed {{ background:var(--chg-bg); color:var(--chg) }}
+.badge.retired {{ background:var(--ret-bg); color:var(--ret) }} .badge.deleted {{ background:var(--del-bg); color:var(--del) }}
+a.ref {{ font-weight:600 }}
+a.term {{ color:inherit; text-decoration:underline dotted var(--muted); text-underline-offset:3px }}
+.broken {{ color:var(--del); text-decoration:underline wavy var(--del) }}
+.refby {{ font-size:.8rem; color:var(--muted); margin-top:.15rem }}
+details.prev summary {{ font-size:.8rem; color:var(--muted); cursor:pointer }}
+.diff {{ margin:.3rem 0 }} .diff.block {{ white-space:pre-wrap; font-size:.9rem; background:var(--panel);
+  padding:.8rem 1rem; border-radius:8px }}
+ins {{ background:var(--new-bg); color:var(--new); text-decoration:none; border-radius:3px }}
+.diff del, .was {{ background:var(--del-bg); color:var(--del); border-radius:3px }}
+.was {{ text-decoration:line-through }}
+.muted {{ color:var(--muted) }}
+.banner {{ display:block; padding:.8rem 1rem; border-radius:10px; background:var(--chg-bg); color:var(--text);
+  margin:0 0 1.5rem; border:1px solid var(--line) }}
+.banner.quiet {{ background:var(--panel) }} .banner.signoff {{ background:var(--chg-bg); border-color:var(--chg) }} .banner .go {{ font-weight:600; color:var(--accent) }}
+a.banner:hover {{ text-decoration:none; border-color:var(--accent) }}
+.warn {{ padding:.7rem 1rem; border-radius:8px; background:var(--del-bg); color:var(--del); margin:1rem 0 }}
+details.other > summary {{ cursor:pointer; color:var(--muted); margin:.5rem 0 }}
+details.other > summary {{ color:var(--text) }}
+ul.items {{ padding-left:1.4rem }}
+ul.files li {{ margin-bottom:.5rem }}
+@media (max-width: 760px) {{
+  .wrap {{ grid-template-columns:1fr }}
+  aside {{ position:static; height:auto; border-right:none; border-bottom:1px solid var(--line) }}
+  main {{ padding:1.2rem 16px 4rem }}
+}}
+</style></head>
+<body><div class="wrap">
+<aside>
+  <div class="brand"><span class="project">{project}</span><span class="sub">spec/</span></div>
+  <select id="branch" aria-label="Branch">{branches}</select>
+  <div class="state">{state} · vs {base}</div>
+  <input id="jump" placeholder="Go to REC-04…" aria-label="Go to requirement" autocomplete="off">
+  {sidebar}
+</aside>
+<main>{body}</main>
+</div>
+<script>
+const JUMP = {jump};
+document.getElementById('branch').onchange = e => {{
+  location.href = '/b/' + e.target.value + '/' + {sub!r};
+}};
+document.getElementById('jump').onkeydown = e => {{
+  if (e.key !== 'Enter') return;
+  const id = e.target.value.trim().toUpperCase().replace(/^([A-Z]+)-?(\\d)$/, '$1-0$2').replace(/^([A-Z]+)(\\d)/, '$1-$2');
+  if (JUMP[id]) location.href = JUMP[id]; else e.target.style.borderColor = 'var(--del)';
+}};
+</script>
+</body></html>
+"""
+
+if __name__ == "__main__":
+    main()

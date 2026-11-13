@@ -1,0 +1,75 @@
+name: Weekly Database Backup
+
+# Weekly logical backup of the PRODUCTION database to S3, independent of the
+# hosting provider's own snapshots/PITR (which live in the same account as the
+# thing they protect, and expire). The dump itself is `bin/db-prod backup`, so
+# the same command works from a laptop; `bin/db-prod restore-test` proves a
+# dump actually restores.
+#
+# Repo settings used (nothing project-specific is hard-coded here):
+#   secrets.DATABASE_URL                 prod connection string
+#   secrets.BACKUP_AWS_ACCESS_KEY_ID     IAM user limited to s3:PutObject on the bucket
+#   secrets.BACKUP_AWS_SECRET_ACCESS_KEY
+#   secrets.ROYALE_URL                   Royale base URL for the failure alert (optional)
+#   vars.BACKUP_S3_BUCKET                bucket name
+#   vars.BACKUP_AWS_REGION               bucket region
+on:
+  schedule:
+    # Every Sunday at 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # PROJECT: MUST be >= the server's major version. pg_dump refuses to dump a
+  # newer server ("server version mismatch"), and ubuntu-latest's preinstalled
+  # client lags the providers — so pin it and install from PGDG.
+  PG_MAJOR: "17"
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y "postgresql-client-${PG_MAJOR}"
+          # Ensure the pinned binary wins over any pre-installed older client.
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" --version
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.BACKUP_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BACKUP_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.BACKUP_AWS_REGION }}
+
+      - name: Run production backup
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_S3_BUCKET: ${{ vars.BACKUP_S3_BUCKET }}
+        run: bash .standards/scripts/db-prod backup
+
+      # A backup job that fails silently is worse than none: everyone believes
+      # there is a backup. Alert on failure (lacta db-backup.yml).
+      - name: Notify on failure
+        if: failure()
+        env:
+          ROYALE_URL: ${{ secrets.ROYALE_URL }}
+          ALERT_TYPE: ${{ github.event.repository.name }}_db_backup_failure
+        run: |
+          if [ -z "$ROYALE_URL" ]; then
+            echo "::warning::ROYALE_URL secret not set — no alert sent"
+            exit 0
+          fi
+          details="${GITHUB_REPOSITORY} weekly production database backup failed. Logs: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n --arg type "$ALERT_TYPE" --arg details "$details" \
+              '{message_type: "report_system_alert", args: {type: $type, details: $details}}' \
+            | curl -sf -X POST "$ROYALE_URL/api/mcp" -H "Content-Type: application/json" -d @- \
+            || echo "::warning::could not send failure notification"

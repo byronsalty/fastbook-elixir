@@ -3,7 +3,6 @@ _build
 deps
 .elixir_ls
 .DS_Store
-.standards
 
 # Environment
 .env

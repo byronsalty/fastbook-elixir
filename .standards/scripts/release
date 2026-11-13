@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Config-driven release script — the ONLY supported way to tag a release.
+#
+# Reads release-config.json from the project root. Everything project-specific
+# (which files carry version numbers, where the changelog lives, how release
+# notes are worded, which store platforms exist) comes from that file, so this
+# script is byte-identical in every project and safe to overwrite on a
+# standards sync. Do not edit it inside a project — see PROJECT_STANDARDS.md
+# > Version Management for how to customize behavior through config instead.
+#
+# Order matters: everything before step 4 aborts with nothing mutated.
+#
+#   0a. refuse unless HEAD is the default branch
+#   0b. refuse a dirty (tracked) tree
+#   0.  git pull --ff-only
+#   1.  just deps
+#   2.  just test                       <- the release gate
+#   3.  release notes + changelog.json  (release-notes script; project override honored;
+#       --mobile also generates the missing store docs into the same commit)
+#   4.  bump VERSION + configured version files
+#   5.  CHANGELOG.md (optional)
+#   6.  commit "Release vX", tag vX, push branch + tag
+#   7.  notify Royale
+
+# Resolve the real script directory through the bin/<name> symlink, and the
+# project root from the symlink's location (bin/..). Running the script directly
+# from .standards/scripts/ also works.
+resolve_script_dir() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+CONFIG_FILE="$PROJECT_ROOT/release-config.json"
+
+# shellcheck source=lib/version-files.sh
+source "$SCRIPT_DIR/lib/version-files.sh"
+
+# Flags are parsed here, up front, and forwarded to release-notes: a typo'd flag
+# or version must fail now, not after the pull and a full test run.
+#   --mobile             also generate the missing store docs
+#                        (<dir>/<version>-<platform>.md, configured platforms only)
+#   --ios-from <ver>     version currently LIVE on the App Store (what users
+#                        upgrade FROM); default = newest existing -ios.md doc
+#   --android-from <ver> same for the Play Store
+parse_release_args "$@"
+for arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+    case "$arg" in
+        --help|-h) VERSION="" ;;
+        *) echo "Error: unknown option '$arg'. See bin/release --help."; exit 1 ;;
+    esac
+done
+
+if [ -z "$VERSION" ]; then
+    echo "Usage: bin/release <version> [--mobile] [--ios-from <ver>] [--android-from <ver>]"
+    echo ""
+    echo "Create a tagged release, push to origin, and trigger production deploy."
+    echo "Version must be semver format (e.g. 0.5.2 or 0.5.2.1 for patches)."
+    echo ""
+    echo "  --mobile             also generate the App Store / Play Store submission docs"
+    echo "                       (<dir>/<version>-{ios,android}.md) and commit them with"
+    echo "                       the release; existing docs are kept"
+    echo "  --ios-from <ver>     version currently LIVE on the App Store (what users"
+    echo "                       upgrade from); defaults to the newest existing -ios.md"
+    echo "  --android-from <ver> same for the Play Store"
+    echo ""
+    echo "Current version: $(cat "$PROJECT_ROOT/VERSION")"
+    echo ""
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "Config: $CONFIG_FILE"
+    else
+        echo "Config: none (will only update VERSION file)"
+    fi
+    exit 0
+fi
+
+TAG="v${VERSION}"
+TODAY=$(date +%Y-%m-%d)
+
+if ! validate_semver "$VERSION"; then
+    echo "Error: Version must be semver (e.g. 1.2.3 or 1.2.3.1)"
+    exit 1
+fi
+
+if git -C "$PROJECT_ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
+    echo "Error: Tag ${TAG} already exists."
+    exit 1
+fi
+
+# Load config (defaults if no config file)
+if [ -f "$CONFIG_FILE" ]; then
+    CHANGELOG=$(jq -r '.changelog // false' "$CONFIG_FILE")
+    CHANGELOG_JSON=$(jq -r '.changelog_json // empty' "$CONFIG_FILE")
+    CHANGELOG_DIR=$(jq -r '.changelog_dir // empty' "$CONFIG_FILE")
+    DEFAULT_BRANCH=$(jq -r '.default_branch // "main"' "$CONFIG_FILE")
+    # Same default as release-notes, or its docs are written but never staged.
+    NOTES_DIR=$(jq -r '.release_notes.dir // "releases"' "$CONFIG_FILE")
+else
+    CHANGELOG="false"
+    CHANGELOG_JSON=""
+    CHANGELOG_DIR=""
+    DEFAULT_BRANCH="main"
+    NOTES_DIR="releases"
+fi
+
+# --mobile preflight — everything release-notes would only discover after the
+# test run: bad flag combinations, a store whose live version can't be
+# determined (never guessed from the last tag), and a --*-from with no tag.
+validate_notes_flags
+if [ "$MOBILE" = true ]; then
+    if [ "$CHANGELOG" != "true" ] && [ -z "$CHANGELOG_JSON" ]; then
+        echo "Error: --mobile needs release notes enabled (changelog / changelog_json in release-config.json)."
+        exit 1
+    fi
+    for PLATFORM in $(configured_platforms); do
+        [ -f "$PROJECT_ROOT/$NOTES_DIR/${VERSION}-${PLATFORM}.md" ] && continue
+        FROM=$(store_live_version "$PLATFORM" "$VERSION" "$PROJECT_ROOT/$NOTES_DIR")
+        if [ -z "$FROM" ]; then
+            echo "Error: no earlier $NOTES_DIR/<ver>-${PLATFORM}.md, so the version live on that store"
+            echo "is unknown. Pass it: just release ${VERSION} --mobile --${PLATFORM}-from <ver>"
+            exit 1
+        fi
+        if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v${FROM}" >/dev/null; then
+            echo "Error: ${PLATFORM} store version ${FROM} has no tag v${FROM} (try: git fetch --tags)."
+            exit 1
+        fi
+    done
+fi
+
+# 0a. Refuse to release from anywhere but the default branch.
+# Step 6 pushes "$DEFAULT_BRANCH" by name, not HEAD, so releasing from a feature
+# branch pushes the tag while the release commit stays behind on the branch. The
+# tag alone triggers the prod deploy, so the tagged code ships with the version
+# files still at the old number, and the script still reports success. (lacta
+# v0.17.1 shipped exactly this way.) The pull in step 0 does not catch it: from
+# a branch that already contains the default branch it just reports "Already up
+# to date" and continues.
+CURRENT_BRANCH=$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD)
+if [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]; then
+    echo "Error: releases must be cut from '${DEFAULT_BRANCH}', but HEAD is '${CURRENT_BRANCH}'."
+    echo ""
+    echo "Merge your work into ${DEFAULT_BRANCH} first, then release from there:"
+    echo "    git checkout ${DEFAULT_BRANCH} && git pull && just release ${VERSION}"
+    exit 1
+fi
+
+# 0b. Refuse to release with a dirty tree. Step 6 stages the version files by name
+# but then commits the whole index, so anything already staged would be swept into
+# the "Release v${VERSION}" commit. Untracked files are ignored -- they are never
+# staged, so they cannot end up in the release commit.
+if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no)" ]; then
+    echo "Error: working tree has uncommitted changes; refusing to release."
+    echo ""
+    git -C "$PROJECT_ROOT" status --short --untracked-files=no
+    echo ""
+    echo "Commit or stash them, then re-run: just release ${VERSION}"
+    exit 1
+fi
+
+echo "==> Releasing v${VERSION}..."
+
+# 0. Pull latest from origin
+echo "  > Pulling latest from origin..."
+if ! git -C "$PROJECT_ROOT" pull --ff-only origin "$DEFAULT_BRANCH"; then
+    echo "Error: Could not fast-forward to origin/$DEFAULT_BRANCH. Resolve conflicts first."
+    exit 1
+fi
+
+# 1. Ensure dependencies are up to date (pull may have changed lock files)
+echo "  > Syncing dependencies..."
+just -f "$PROJECT_ROOT/justfile" deps 2>/dev/null || true
+
+# 2. Run tests before touching anything (gate before any changes)
+echo "  > Running test suite..."
+if ! just -f "$PROJECT_ROOT/justfile" test; then
+    echo "Error: Tests failed. Fix them before releasing."
+    exit 1
+fi
+echo "  > Tests passed."
+
+# 3. Release notes + changelog.json.
+#
+# Delegated to the release-notes script, which is idempotent (re-running for the
+# same version updates the entry in place and keeps existing docs) so a bad
+# generation can be fixed without re-tagging. It aborts before anything is
+# mutated on a stale in-app changelog, a failed --mobile store doc, a bad
+# changelog.d/ entry, or any release_notes.unannounced_terms hit. It also drains the pending changelog.d/ entries and
+# deletes the files it consumed; we stage the directory below so those
+# deletions land in the release commit.
+#
+# A project may ship its own bin/release-notes (a regular file, not the
+# standard symlink) to take over this step entirely — that is the supported
+# extension point for release-notes behavior config can't express.
+RELEASE_NOTES=""
+NOTES_HANDLED=false
+if [ "$CHANGELOG" = "true" ] || [ -n "$CHANGELOG_JSON" ]; then
+    if [ -x "$PROJECT_ROOT/bin/release-notes" ]; then
+        NOTES_SCRIPT="$PROJECT_ROOT/bin/release-notes"
+    else
+        NOTES_SCRIPT="$SCRIPT_DIR/release-notes"
+    fi
+    echo "  > Generating release notes via ${NOTES_SCRIPT#"$PROJECT_ROOT/"}..."
+    RELEASE_NOTES=$("$NOTES_SCRIPT" "$VERSION" ${NOTES_ARGS[@]+"${NOTES_ARGS[@]}"})
+    NOTES_HANDLED=true
+fi
+
+# 4. Update VERSION file + configured version files
+echo "  > Updating VERSION file..."
+echo "$VERSION" > "$PROJECT_ROOT/VERSION"
+FILES_TO_COMMIT="VERSION"
+
+CHANGED=$(bump_version_files "$VERSION")
+if [ -n "$CHANGED" ]; then
+    FILES_TO_COMMIT="$FILES_TO_COMMIT $(echo "$CHANGED" | tr '\n' ' ')"
+fi
+
+# 5. Update CHANGELOG.md if enabled
+if [ "$CHANGELOG" = "true" ] && [ -f "$PROJECT_ROOT/CHANGELOG.md" ]; then
+    echo "  > Updating CHANGELOG.md..."
+    TMPFILE=$(mktemp)
+    ENTRY_HEADER="## v${VERSION} - ${TODAY}"
+    {
+        sed -n '1,/^## \[Unreleased\]/p' "$PROJECT_ROOT/CHANGELOG.md"
+        echo ""
+        echo "$ENTRY_HEADER"
+        echo ""
+        echo "$RELEASE_NOTES"
+        echo ""
+        sed '1,/^## \[Unreleased\]/d' "$PROJECT_ROOT/CHANGELOG.md"
+    } > "$TMPFILE"
+    mv "$TMPFILE" "$PROJECT_ROOT/CHANGELOG.md"
+    FILES_TO_COMMIT="$FILES_TO_COMMIT CHANGELOG.md"
+fi
+
+# 5b. Stage what the release-notes step produced: changelog.json, the drained
+# changelog.d/ directory (so deletions are committed), and every release-notes
+# doc for this version — including store docs --mobile just generated, which
+# must ride in the Release commit rather than be left untracked. Everything guarded on existence — `git add` on a
+# missing path aborts the release.
+if [ "$NOTES_HANDLED" = true ]; then
+    [ -n "$CHANGELOG_JSON" ] && [ -f "$PROJECT_ROOT/$CHANGELOG_JSON" ] && \
+        FILES_TO_COMMIT="$FILES_TO_COMMIT $CHANGELOG_JSON"
+    [ -n "$CHANGELOG_DIR" ] && [ -d "$PROJECT_ROOT/$CHANGELOG_DIR" ] && \
+        FILES_TO_COMMIT="$FILES_TO_COMMIT $CHANGELOG_DIR"
+    if [ -n "$NOTES_DIR" ]; then
+        for NOTES_DOC in "$NOTES_DIR/${VERSION}.md" "$NOTES_DIR/${VERSION}-ios.md" "$NOTES_DIR/${VERSION}-android.md"; do
+            [ -f "$PROJECT_ROOT/$NOTES_DOC" ] && FILES_TO_COMMIT="$FILES_TO_COMMIT $NOTES_DOC"
+        done
+    fi
+fi
+
+# 6. Commit and tag
+echo "  > Committing..."
+cd "$PROJECT_ROOT"
+# shellcheck disable=SC2086
+git add $FILES_TO_COMMIT
+# --no-verify: step 2's `just test` already ran the full suite on this exact
+# code. The commit only bumps version strings, but staging a version file like
+# mix.exs makes the pre-commit hook re-run compile + the whole test suite for
+# nothing.
+git commit --no-verify -m "Release v${VERSION}"
+
+echo "  > Tagging ${TAG}..."
+git tag -a "${TAG}" -m "Release ${VERSION}"
+
+echo "  > Pushing to origin..."
+git push origin "$DEFAULT_BRANCH" "${TAG}"
+
+echo ""
+echo "==> Released v${VERSION}!"
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
+if [ -n "$REMOTE_URL" ]; then
+    REPO=$(echo "$REMOTE_URL" | sed 's|.*github.com[:/]||;s|\.git$||')
+    echo "    Deploy workflow triggered: https://github.com/${REPO}/actions"
+
+    # 7. Notify Royale (tag merged tickets with this release)
+    ROYALE_URL="${ROYALE_URL:-https://royale.saltylabs.com}"
+    curl -sf -X POST "$ROYALE_URL/api/releases" \
+        -H "Content-Type: application/json" \
+        -d "{\"repo\": \"$REPO\", \"version\": \"$VERSION\"}" \
+        && echo "    Royale: tagged tickets for v${VERSION}" \
+        || echo "    Royale: notification skipped (couldn't reach API)"
+fi
+
+if [ -n "$NOTES_DIR" ]; then
+    for NOTES_DOC in "$NOTES_DIR/${VERSION}.md" "$NOTES_DIR/${VERSION}-ios.md" "$NOTES_DIR/${VERSION}-android.md"; do
+        if [ -f "$PROJECT_ROOT/$NOTES_DOC" ]; then
+            echo "    Release notes: $NOTES_DOC"
+        fi
+    done
+fi
+
+# The release is done; don't let a trailing test's status become the exit code.
+exit 0

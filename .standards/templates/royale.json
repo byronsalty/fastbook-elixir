@@ -1,0 +1,5 @@
+{
+  "test_patterns": ["webapp/test/**/*_test.exs"],
+  "test_command": "cd webapp && mix test",
+  "source_patterns": ["webapp/lib/**/*.ex"]
+}

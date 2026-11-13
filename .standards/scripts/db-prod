@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Production database safety net: off-provider backups, proof that they
+# restore, and pre-deploy snapshots.
+#
+#   bin/db-prod backup [--no-upload]   pg_dump prod -> s3://$BACKUP_S3_BUCKET/prod-backup-<ts>.dump
+#   bin/db-prod restore-test           restore the newest S3 dump into a throwaway
+#                                      Neon branch, sanity-check it, delete the branch
+#   bin/db-prod branch [label]         Neon branch of prod right now (read-only
+#                                      endpoint) — run before a risky migration
+#
+# Configuration — environment first, then .env.prod at the project root. Each
+# variable is read INDIVIDUALLY with grep; .env.prod is never sourced, so a
+# stray line in it can't execute and unrelated prod secrets never enter this
+# shell's environment. Nothing project-specific lives in this script:
+#
+#   DATABASE_URL       backup, restore-test   prod connection string (restore-test
+#                                             reuses its user/password/db name, which
+#                                             Neon branches inherit from the parent)
+#   BACKUP_S3_BUCKET   backup, restore-test   bucket name (no s3:// prefix)
+#   NEON_API_KEY       branch, restore-test
+#   NEON_PROJECT_ID    branch, restore-test
+#
+# Missing variables fail loudly, naming the variable. Values are never echoed.
+# Also needs: pg_dump/pg_restore/psql (major >= the server's), aws CLI with
+# credentials for the bucket, curl, jq, python3.
+#
+# CI: .standards/workflows/db-backup.yml runs `backup` weekly.
+#
+# Why each piece exists:
+#   * backup — provider snapshots/PITR live in the same account as the database
+#     they protect and age out; a weekly dump in S3 is the copy that survives
+#     the provider (lacta bin/db-backup-prod).
+#   * restore-test — an untested backup is a hope. lacta's original version
+#     restored INTO a branch of prod, which already held every table, so the
+#     restore errored quietly (`|| true`) and the "tables > 0" check passed on
+#     the branch's own data: it could never fail. This one empties the branch's
+#     public schema first, so everything it finds came from the dump.
+#   * branch — an instant copy-on-write snapshot before a deploy with a
+#     destructive migration; restoring is "point the app at the branch".
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(basename "$PROJECT_ROOT")" = ".standards" ] && PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+ENV_FILE="$PROJECT_ROOT/.env.prod"
+NEON_API="https://console.neon.tech/api/v2"
+
+die() { echo "Error: $*" >&2; exit 1; }
+ts() { date -u +"%Y-%m-%d-%H%M%S"; }
+
+# load VAR — VAR="${VAR:-$(grep '^VAR=' .env.prod | cut -d= -f2-)}", without
+# tripping `set -e` when the file or the line is absent.
+load() {
+    local var="$1" val=""
+    if [ -z "${!var:-}" ]; then
+        [ -f "$ENV_FILE" ] && val="$(grep "^${var}=" "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+        printf -v "$var" '%s' "$val"
+    fi
+}
+require() {
+    local var
+    for var in "$@"; do
+        load "$var"
+        [ -n "${!var:-}" ] || die "$var is not set (export it, or add $var=... to $ENV_FILE)"
+    done
+}
+need_cmd() {
+    local c
+    for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "'$c' not found on PATH"; done
+}
+
+# neon METHOD PATH [JSON] — prints the body; dies with Neon's message (never
+# the whole body: a branch-create response carries connection URIs with
+# passwords) on a non-2xx.
+neon() {
+    local method="$1" path="$2" out code
+    local body=()
+    [ -n "${3:-}" ] && body=(-d "$3")
+    out="$(mktemp)"
+    code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "$NEON_API$path" \
+        -H "Authorization: Bearer ${NEON_API_KEY}" \
+        -H "Content-Type: application/json" \
+        "${body[@]}") || { rm -f "$out"; die "Neon API $method $path: request failed"; }
+    if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+        local msg
+        msg=$(jq -r '.message // "no message"' "$out" 2>/dev/null || echo "unparseable response")
+        rm -f "$out"
+        die "Neon API $method $path returned HTTP $code: $msg"
+    fi
+    cat "$out"
+    rm -f "$out"
+}
+
+create_branch() {  # create_branch NAME read_only|read_write -> response JSON
+    neon POST "/projects/${NEON_PROJECT_ID}/branches" \
+        "$(jq -n --arg name "$1" --arg type "$2" '{branch: {name: $name}, endpoints: [{type: $type}]}')"
+}
+
+# ---------------------------------------------------------------------------
+
+cmd_backup() {
+    local upload=true arg
+    for arg in "$@"; do
+        case "$arg" in
+            --no-upload) upload=false ;;
+            *) die "unknown argument to backup: $arg" ;;
+        esac
+    done
+    require DATABASE_URL
+    need_cmd pg_dump
+    if $upload; then
+        require BACKUP_S3_BUCKET
+        need_cmd aws
+    fi
+
+    local dir="$PROJECT_ROOT/backups" file
+    mkdir -p "$dir"
+    file="prod-backup-$(ts).dump"
+
+    echo "==> pg_dump ($(pg_dump --version)) -> backups/$file"
+    # Custom format (-F c): compressed, and pg_restore can reorder/select.
+    pg_dump "$DATABASE_URL" -F c -b -f "$dir/$file"
+    echo "    $(du -h "$dir/$file" | cut -f1)"
+
+    if $upload; then
+        echo "==> Uploading to s3://${BACKUP_S3_BUCKET}/${file}"
+        aws s3 cp "$dir/$file" "s3://${BACKUP_S3_BUCKET}/${file}" --sse aws:kms --only-show-errors
+        rm -f "$dir/$file"
+        echo "    uploaded; local copy removed"
+    else
+        echo "    --no-upload: kept backups/$file"
+    fi
+    echo "Backup finished $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+}
+
+cmd_restore_test() {
+    [ $# -eq 0 ] || die "restore-test takes no arguments"
+    require DATABASE_URL BACKUP_S3_BUCKET NEON_API_KEY NEON_PROJECT_ID
+    need_cmd aws pg_restore psql jq python3 curl
+
+    local latest work branch_id="" host
+    latest=$(aws s3 ls "s3://${BACKUP_S3_BUCKET}/" | awk '{print $4}' | grep '^prod-backup-.*\.dump$' | sort | tail -n1 || true)
+    [ -n "$latest" ] || die "no prod-backup-*.dump in s3://${BACKUP_S3_BUCKET}/"
+    echo "==> Latest backup: $latest"
+
+    work="$(mktemp -d)"
+    # Always delete the branch and the local dump, whatever step fails.
+    cleanup() {
+        if [ -n "$branch_id" ]; then
+            # Subshell: neon's `die` must not exit from inside the EXIT trap.
+            ( neon DELETE "/projects/${NEON_PROJECT_ID}/branches/${branch_id}" ) >/dev/null \
+                && echo "==> Branch deleted" \
+                || echo "WARNING: could not delete Neon branch $branch_id — delete it by hand" >&2
+        fi
+        rm -rf "$work"
+    }
+    trap cleanup EXIT
+
+    aws s3 cp "s3://${BACKUP_S3_BUCKET}/${latest}" "$work/$latest" --only-show-errors
+
+    local name resp
+    name="restore-test-$(ts)"
+    echo "==> Creating throwaway Neon branch $name"
+    resp=$(create_branch "$name" read_write)
+    branch_id=$(jq -r '.branch.id // empty' <<<"$resp")
+    host=$(jq -r '.endpoints[0].host // empty' <<<"$resp")
+    [ -n "$branch_id" ] && [ -n "$host" ] || die "branch create returned no branch id / endpoint host"
+
+    # Connection to the BRANCH: prod's user/db/password (Neon branches inherit
+    # roles) with the host swapped. Password goes via PGPASSWORD, not argv.
+    local parts url
+    parts=$(python3 - "$DATABASE_URL" "$host" <<'PY'
+import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+user = u.unquote(p.username or "")
+pw = u.unquote(p.password or "")
+q = p.query or "sslmode=require"
+print(u.urlunsplit((p.scheme, u.quote(user, safe="") + "@" + sys.argv[2], p.path, q, "")))
+print(pw)
+PY
+)
+    url=$(sed -n 1p <<<"$parts")
+    export PGPASSWORD
+    PGPASSWORD=$(sed -n 2p <<<"$parts")
+
+    # Never touch prod: the branch endpoint must not be the host we dumped from.
+    [[ "$DATABASE_URL" != *"@${host}"* ]] || die "branch endpoint equals the prod host — refusing"
+
+    echo "==> Waiting for the branch endpoint"
+    local i
+    for i in $(seq 1 30); do
+        psql "$url" -Atqc 'select 1' >/dev/null 2>&1 && break
+        [ "$i" -eq 30 ] && die "branch endpoint never accepted connections"
+        sleep 2
+    done
+
+    # The branch is a copy of prod, so it already holds every table. Empty it,
+    # or the restore collides with existing objects and the checks below would
+    # measure the branch's inherited data instead of the dump (see header).
+    psql "$url" -q -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+
+    echo "==> pg_restore"
+    local log="$work/restore.log" rc=0
+    pg_restore -d "$url" --no-owner --no-acl "$work/$latest" 2>"$log" || rc=$?
+    # Non-zero is normal-ish (e.g. COMMENT ON EXTENSION needs superuser); the
+    # data checks below are the verdict. Surface the count, not silence.
+    if [ "$rc" -ne 0 ]; then
+        echo "    pg_restore exited $rc with $(grep -c 'error:' "$log" || true) error(s); first few:"
+        grep 'error:' "$log" | head -5 | sed 's/^/      /' || true
+    fi
+
+    psql "$url" -q -c 'ANALYZE' >/dev/null
+    local tables rows
+    tables=$(psql "$url" -Atc "select count(*) from information_schema.tables where table_schema = 'public'")
+    rows=$(psql "$url" -Atc "select coalesce(sum(greatest(reltuples, 0)), 0)::bigint from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'")
+    echo "    tables: $tables, rows (estimated): $rows"
+    psql "$url" -c "select c.relname as table, greatest(c.reltuples, 0)::bigint as rows from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.reltuples desc limit 10"
+
+    echo ""
+    if [ "${tables:-0}" -eq 0 ] || [ "${rows:-0}" -eq 0 ]; then
+        echo "=== Restore test: FAIL — $latest restored no tables/rows ==="
+        exit 1
+    fi
+    echo "=== Restore test: PASS — $latest ($tables tables, ~$rows rows) ==="
+}
+
+cmd_branch() {
+    [ $# -le 1 ] || die "usage: bin/db-prod branch [label]"
+    require NEON_API_KEY NEON_PROJECT_ID
+    need_cmd curl jq
+
+    local name resp
+    name="${1:-backup}-$(ts)"
+    echo "==> Creating Neon branch $name from production (read-only endpoint)"
+    resp=$(create_branch "$name" read_only)
+    echo "    name: $name"
+    echo "    id:   $(jq -r '.branch.id' <<<"$resp")"
+    echo "    host: $(jq -r '.endpoints[0].host // "?"' <<<"$resp")"
+    echo "Delete it when no longer needed (branches count against the project's limit)."
+}
+
+usage() {
+    sed -n '/^#   bin\/db-prod/,/^#$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1
+}
+
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+    backup)       cmd_backup "$@" ;;
+    restore-test) cmd_restore_test "$@" ;;
+    branch)       cmd_branch "$@" ;;
+    *)            usage ;;
+esac
